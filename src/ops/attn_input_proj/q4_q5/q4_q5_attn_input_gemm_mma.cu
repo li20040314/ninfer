@@ -1,6 +1,8 @@
 #include "core/weight.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h"
 
+#include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_geometry.h"
+
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/common/rowsplit_grouped_mma.cuh"
@@ -56,16 +58,22 @@ void launch_pair(bool full, const Tensor& x, RowSplitGroupedMmaJob first,
     CUDA_CHECK(cudaGetLastError());
 }
 
+// A fused parent holds `query + key` (or `gate + value`) rows; the seam between the folded halves
+// is the query/gate row count and the tail is the key/value row count. Both are read from the
+// operands, so one launch serves every admitted geometry.
 template <class Schedule>
-void launch_slice(const Tensor& x, const Weight& query_key_weight, const Weight& gate_value_weight,
-                  Tensor& q, Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
-    const bool full = (x.ne[1] % Schedule::BN) == 0;
+void launch_folded(const Tensor& x, const Weight& query_key_weight,
+                   const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                   cudaStream_t stream) {
+    const std::int32_t split_row = q.ne[0];
+    const std::int32_t kv_rows   = k.ne[0];
+    const bool full              = (x.ne[1] % Schedule::BN) == 0;
     launch_pair<Schedule, RowSplitGroupedMmaCodec::Q4>(
-        full, x, make_job(query_key_weight, 0, 6144, q), make_job(query_key_weight, 6144, 1024, k),
-        stream);
+        full, x, make_job(query_key_weight, 0, split_row, q),
+        make_job(query_key_weight, split_row, kv_rows, k), stream);
     launch_pair<Schedule, RowSplitGroupedMmaCodec::Q5>(
-        full, x, make_job(gate_value_weight, 0, 6144, gate),
-        make_job(gate_value_weight, 6144, 1024, v), stream);
+        full, x, make_job(gate_value_weight, 0, split_row, gate),
+        make_job(gate_value_weight, split_row, kv_rows, v), stream);
 }
 
 template <class Schedule>
@@ -78,8 +86,8 @@ void launch(const Tensor& x, const Weight& query_key_weight, const Weight& gate_
         Tensor gate_slice    = gate.slice(1, offset, count);
         Tensor k_slice       = k.slice(1, offset, count);
         Tensor v_slice       = v.slice(1, offset, count);
-        launch_slice<Schedule>(x_slice, query_key_weight, gate_value_weight, q_slice, gate_slice,
-                               k_slice, v_slice, stream);
+        launch_folded<Schedule>(x_slice, query_key_weight, gate_value_weight, q_slice, gate_slice,
+                                k_slice, v_slice, stream);
     });
 }
 
@@ -88,12 +96,17 @@ using MmaR32C64S4 = GemmCfg<32, 64, 64, 16, 16, 4, 1, false, true, true>;
 template <class S, bool Full>
 void mixed_slice(const Tensor& x, const Weight& w0, const Weight& w1, Tensor& q, Tensor& g,
                  Tensor& k, Tensor& v, cudaStream_t stream) {
-    const dim3 grid(14336 / S::BM, (x.ne[1] + S::BN - 1) / S::BN);
+    const std::int32_t split_row = q.ne[0];
+    const std::int32_t kv_rows   = k.ne[0];
+    const dim3 grid(static_cast<unsigned>(div_up(w0.n + w1.n, S::BM)),
+                    static_cast<unsigned>(div_up(x.ne[1], S::BN)));
     rowsplit_grouped_mma_kernel<S, Full, RowSplitGroupedMmaCodec::Mixed, 4>
         <<<grid, S::THREADS, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
-                                          make_job(w0, 0, 6144, q), make_job(w0, 6144, 1024, k),
-                                          make_job(w1, 0, 6144, g), make_job(w1, 6144, 1024, v),
-                                          5120, x.ne[1], 5120);
+                                          make_job(w0, 0, split_row, q),
+                                          make_job(w0, split_row, kv_rows, k),
+                                          make_job(w1, 0, split_row, g),
+                                          make_job(w1, split_row, kv_rows, v), x.ne[0], x.ne[1],
+                                          x.ne[0]);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -110,6 +123,7 @@ void launch_mixed(const Tensor& x, const Weight& w0, const Weight& w1, Tensor& q
             mixed_slice<S, false>(xs, w0, w1, qs, gs, ks, vs, stream);
     });
 }
+
 } // namespace
 
 void q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(const Tensor& x, const Weight& query_key_weight,

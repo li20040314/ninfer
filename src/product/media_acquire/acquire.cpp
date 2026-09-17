@@ -1,10 +1,23 @@
 #include "product/media_acquire/acquire.h"
 
+// The address classification below uses the BSD socket API. Winsock declares the same types,
+// constants and helpers under the same names, so only the headers differ. winsock2.h has to be
+// reached before anything that could pull in windows.h, and NOMINMAX keeps the min/max macros that
+// <windef.h> defines from breaking every std::min/std::max below. libcurl's global init has already
+// run WSAStartup by the time these functions are called, so getaddrinfo needs no extra setup.
+#if defined(_WIN32)
+#    define NOMINMAX
+#    include <winsock2.h>
+#    include <ws2tcpip.h>
+#endif
+
 #include <curl/curl.h>
 
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <sys/socket.h>
+#if !defined(_WIN32)
+#    include <arpa/inet.h>
+#    include <netdb.h>
+#    include <sys/socket.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -287,7 +300,10 @@ std::vector<std::uint8_t> read_path(const Source& source, const Policy& policy) 
     if (!policy.media_root.empty()) {
         const std::filesystem::path root = std::filesystem::weakly_canonical(policy.media_root, ec);
         const auto relative              = std::filesystem::relative(path, root, ec);
-        if (ec || relative.empty() || relative.native().starts_with("..")) {
+        // `native()` is wchar_t-based on Windows, so the prefix must carry the path's own character
+        // type instead of a narrow literal.
+        const std::filesystem::path parent("..");
+        if (ec || relative.empty() || relative.native().starts_with(parent.native())) {
             throw std::invalid_argument("media path is outside configured media root");
         }
     }

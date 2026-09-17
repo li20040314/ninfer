@@ -15,6 +15,12 @@ constexpr std::array kShapes{
     ShapeEntry{7168, 5120, select_q5_n7168_k5120},   ShapeEntry{5120, 6144, select_q5_n5120_k6144},
     ShapeEntry{5120, 17408, select_q5_n5120_k17408}, ShapeEntry{1152, 1152, select_q5_n1152_k1152},
     ShapeEntry{1152, 4304, select_q5_n1152_k4304},
+    // Qwen3.5-9B (hidden_size 4096).
+    ShapeEntry{1024, 4096, select_q5_n1024_k4096},
+    ShapeEntry{4096, 4096, select_q5_n4096_k4096},
+    ShapeEntry{5120, 4096, select_q5_n5120_k4096},
+    ShapeEntry{8192, 4096, select_q5_n8192_k4096},
+    ShapeEntry{4096, 12288, select_q5_n4096_k12288},
 };
 } // namespace
 

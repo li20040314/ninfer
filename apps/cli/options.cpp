@@ -88,7 +88,8 @@ std::string usage_text(const char* argv0) {
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
            "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
-           "       [--no-cuda-graph]\n"
+           "       [--no-cuda-graph] [--offload-ratio F] [--host-embedding] [--host-output-head]\n"
+           "       [--host-linear]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
@@ -158,6 +159,17 @@ Options parse_options(int argc, char** argv) {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--offload-ratio") {
+            options.weight_offload_ratio = parse_float(value(arg), "offload-ratio", 0.0F, 1.0F);
+            if (options.weight_offload_ratio >= 1.0F) {
+                throw std::invalid_argument("--offload-ratio must be below 1.0");
+            }
+        } else if (arg == "--host-embedding") {
+            options.host_embedding = true;
+        } else if (arg == "--host-output-head") {
+            options.host_output_head = true;
+        } else if (arg == "--host-linear") {
+            options.host_linear = true;
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {

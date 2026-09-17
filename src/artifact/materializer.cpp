@@ -115,10 +115,14 @@ const WeightParent& MaterializedArtifact::host_parent(ObjectHandle handle) const
 }
 
 std::span<const std::byte> MaterializedArtifact::host_bytes(ObjectHandle handle) const {
-    if (handle.index >= objects_.size() || objects_[handle.index].host_data.empty()) {
-        throw ArtifactError("object has no retained Host bytes");
+    if (handle.index >= objects_.size()) { throw ArtifactError("object has no retained Host bytes"); }
+    const auto& storage = objects_[handle.index];
+    if (storage.host_pinned) {
+        return {static_cast<const std::byte*>(storage.host_pinned->data()),
+                storage.host_pinned->size()};
     }
-    return objects_[handle.index].host_data;
+    if (storage.host_data.empty()) { throw ArtifactError("object has no retained Host bytes"); }
+    return storage.host_data;
 }
 
 bool MaterializedArtifact::has_device(ObjectHandle handle) const noexcept {
@@ -156,7 +160,9 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     for (auto& placement : plan.host_objects) {
         reader.validate_object(placement.object);
         auto& storage = out.objects_.at(placement.object.index);
-        if (!storage.host_data.empty()) { throw ArtifactError("duplicate Host placement"); }
+        if (!storage.host_data.empty() || storage.host_pinned) {
+            throw ArtifactError("duplicate Host placement");
+        }
         const auto& object = reader.directory().object(placement.object);
         if (placement.data.empty()) {
             placement.data = reader.read_object(placement.object);
@@ -166,14 +172,28 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         if (placement.data.size() != object_bytes(object)) {
             throw ArtifactError("Host placement size differs from object");
         }
-        storage.host_data = std::move(placement.data);
+        std::span<const std::byte> retained;
+        if (placement.page_locked) {
+            // Page-lock at allocation time. cudaHostRegister on the plain bytes below is not an
+            // option on this platform: it reports success and then faults the first device read,
+            // and a fault is sticky for the whole context (measured). The read buffer is released
+            // right after the copy so the peak cost is one extra pass, not a second resident copy.
+            storage.host_pinned = std::make_unique<PinnedHostBuffer>(placement.data.size());
+            std::memcpy(storage.host_pinned->data(), placement.data.data(), placement.data.size());
+            std::vector<std::byte>().swap(placement.data);
+            retained = {static_cast<const std::byte*>(storage.host_pinned->data()),
+                        storage.host_pinned->size()};
+        } else {
+            storage.host_data = std::move(placement.data);
+            retained          = storage.host_data;
+        }
         out.stats_.retained_host_bytes =
-            checked_add(out.stats_.retained_host_bytes, storage.host_data.size(), "retained bytes");
+            checked_add(out.stats_.retained_host_bytes, retained.size(), "retained bytes");
         if (std::holds_alternative<TensorObject>(object)) {
             const auto& geometry = reader.geometry(placement.object);
             const auto divisor =
-                read_divisor(reader, placement.object, geometry, storage.host_data, out.stats_);
-            storage.host = WeightParent{geometry, storage.host_data.data(), divisor};
+                read_divisor(reader, placement.object, geometry, retained, out.stats_);
+            storage.host = WeightParent{geometry, retained.data(), divisor};
         }
     }
     std::vector<CopyRange> ranges;

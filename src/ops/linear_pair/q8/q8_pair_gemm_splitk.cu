@@ -122,6 +122,7 @@ void q8_pair_splitk_exact_t_launch(const Tensor& x, const Weight& first_weight,
     CUDA_CHECK(cudaGetLastError());
 }
 
+#if NINFER_ENABLE_LARGE_STATIC_SMEM
 void q8_pair_splitk_medium_launch(Q8PairScheduleId schedule, const Tensor& x,
                                   const Weight& first_weight, const Weight& second_weight,
                                   Tensor& first_out, Tensor& second_out, cudaStream_t stream) {
@@ -231,5 +232,14 @@ void q8_pair_splitk_medium_launch(Q8PairScheduleId schedule, const Tensor& x,
     }
     throw std::invalid_argument("Q8 medium pair schedule does not cover this T");
 }
+#else
+// The medium routes stage their K-split tiles above the 48 KiB of static __shared__ this target
+// allows; the exact-tail route in this same unit stays available.
+void q8_pair_splitk_medium_launch(Q8PairScheduleId, const Tensor&, const Weight&, const Weight&,
+                                  Tensor&, Tensor&, cudaStream_t) {
+    throw std::invalid_argument(
+        "Q8 medium pair: unavailable on this architecture (static shared memory limit)");
+}
+#endif
 
 } // namespace ninfer::ops::detail

@@ -105,6 +105,44 @@ int q5_a16_conformance() {
     failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
                           {1152, 4304, 181U, Comparison::Sampled, false, kN1152K4304});
 
+    // Qwen3.5-9B (hidden_size 4096). The Q5 GEMV entry point is keyed on a compile-time k = 5120
+    // and an exact n in {6144, 7168}, so these shapes must fall back to the SIMT/MMA ladder.
+    constexpr std::array kN1024K4096{
+        convenience(1), a16(2), a16(4), a16(5), a16(16), a16(17), a16(128),
+    };
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
+                          {1024, 4096, 241U, Comparison::Full, true, kN1024K4096});
+
+    constexpr std::array kN4096K4096{
+        a16(1), a16(4), a16(5), a16(16), a16(17), a16(128),
+    };
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
+                          {4096, 4096, 251U, Comparison::Sampled, false, kN4096K4096});
+
+    constexpr std::array kN5120K4096{
+        a16(1), a16(4), a16(5), a16(16), a16(17), a16(128),
+    };
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
+                          {5120, 4096, 257U, Comparison::Sampled, false, kN5120K4096});
+
+    constexpr std::array kN8192K4096{
+        a16(1), a16(4), a16(5), a16(16), a16(17), a16(128),
+    };
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
+                          {8192, 4096, 263U, Comparison::Sampled, false, kN8192K4096});
+
+    constexpr std::array kN4096K12288{
+        a16(1), a16(4), a16(5), a16(16), a16(17), a16(128),
+    };
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
+                          {4096, 12288, 269U, Comparison::Sampled, false, kN4096K12288});
+
+    failures += verify_workspace_envelopes(ninfer::QType::Q5_G64_FP16, 1024, 4096);
+    failures += verify_workspace_envelopes(ninfer::QType::Q5_G64_FP16, 4096, 4096);
+    failures += verify_workspace_envelopes(ninfer::QType::Q5_G64_FP16, 5120, 4096);
+    failures += verify_workspace_envelopes(ninfer::QType::Q5_G64_FP16, 8192, 4096);
+    failures += verify_workspace_envelopes(ninfer::QType::Q5_G64_FP16, 4096, 12288);
+
     return failures;
 }
 

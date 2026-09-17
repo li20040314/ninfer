@@ -5,6 +5,7 @@
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/execution/workspace.h"
+#include "models/qwen3_5/offload_stream.h"
 
 #include "core/nvtx.h"
 #include "models/qwen3_5/execution/visual_scatter.h"
@@ -237,7 +238,8 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
                          std::uint32_t text_kv_base, qwen3_5::PagedKVCacheView mtp_kv,
                          const qwen3_5::PagedKVCache* batch_text_kv,
                          const qwen3_5::PagedKVCache* batch_mtp_kv)
-    : ctx_(ctx), parameters_(weights), config_(weights.model.config().text), work_(work), kv_(kv),
+    : ctx_(ctx), parameters_(weights), streamed_(weights.model.offload_stream()),
+      config_(weights.model.config().text), work_(work), kv_(kv),
       mtp_kv_(mtp_kv), state_(state), io_(io), prefill_hidden_(prefill_hidden),
       prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base), batch_text_kv_(batch_text_kv),
       batch_mtp_kv_(batch_mtp_kv) {
@@ -1080,6 +1082,9 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
         const auto& block  = parameters_.text.layers[layer];
         const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
         const auto compact = dimension(config_.compact_layer_indices[layer]);
+        if (streamed_ != nullptr) {
+            streamed_->ensure_layer(static_cast<int>(layer), ctx_.stream);
+        }
         nvtx::ScopedRange layer_range(
             full ? (prefill ? nvtx::Name::PrefillLayerFull : nvtx::Name::VerifyLayerFull)
                  : (prefill ? nvtx::Name::PrefillLayerGdn : nvtx::Name::VerifyLayerGdn),

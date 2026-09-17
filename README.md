@@ -28,10 +28,13 @@ the weights again.
 
 ## Quick start
 
-NInfer requires 64-bit Linux, an NVIDIA GeForce RTX 5090, CUDA Toolkit 13.1 or newer, CMake 3.28 or
-newer, a C++20 host compiler, Ninja, `pkg-config`, FFmpeg development libraries
+NInfer requires 64-bit Linux or Windows, an NVIDIA GeForce RTX 5090 (`sm_120a`) or an Ada GPU
+(`sm_89`, for example an RTX 4060), CUDA Toolkit 13.1 or newer, CMake 3.28 or newer, a C++20 host
+compiler (GNU/Clang on Linux, MSVC on Windows), Ninja, `pkg-config`, FFmpeg development libraries
 (`libavformat >= 60`, `libavcodec >= 60`, `libavutil >= 58`, and `libswscale >= 7`), and
-`libcurl >= 7.85`. The build rejects CUDA architectures other than `sm_120a`.
+`libcurl >= 7.85`. The build accepts the CUDA architectures `89` and `120a`. An `sm_89` target omits
+the Blackwell-only kernels and the q8 families that exceed its 48 KiB static `__shared__` limit, and
+the routes those served fail loudly at planning time rather than degrading.
 
 Build the product binaries:
 

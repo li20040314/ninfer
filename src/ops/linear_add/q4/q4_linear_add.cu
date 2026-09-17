@@ -47,6 +47,13 @@ using GemvR1W8 =
                            Q4GemvLaneMapping::PackedByte2, Q4GemvDecodeMode::ScalarInteger,
                            Q4GemvCodeTransfer::SyncVector16, Q4GemvScaleAccess::Scalar16Shuffle,
                            Cache::ca, 6144 / 64, 1>;
+// K=17408 (Qwen3.8-27B mlp/down): 272 groups per row split across 17 warps into one
+// 16-group tile per warp; 136 scale pairs divide evenly across the warps.
+using GemvR1W8K17408 =
+    Q4RowSplitGemvSchedule<1, 17, 16, 1, Q4GemvActivationAccess::Direct,
+                           Q4GemvLaneMapping::PackedByte2, Q4GemvDecodeMode::ScalarInteger,
+                           Q4GemvCodeTransfer::SyncVector16, Q4GemvScaleAccess::Scalar16Shuffle,
+                           Cache::ca, 17408 / 64, 1>;
 using MmaR32C32  = Q4RowSplitMmaGemmSchedule<32, 32, 64, 16, 16, 3, 2, Q4FragmentPipeline::Serial,
                                              Cache::cg, Cache::cg, Q4ScaleLoad::Pair32>;
 using MmaR32C64  = Q4RowSplitMmaGemmSchedule<32, 64, 64, 16, 32, 3, 2, Q4FragmentPipeline::Serial,
@@ -54,9 +61,9 @@ using MmaR32C64  = Q4RowSplitMmaGemmSchedule<32, 64, 64, 16, 32, 3, 2, Q4Fragmen
 using MmaR64C128 = Q4RowSplitMmaGemmSchedule<64, 128, 64, 64, 32, 2, 1, Q4FragmentPipeline::Serial,
                                              Cache::cg, Cache::cg, Q4ScaleLoad::Pair32>;
 
-template <int Capacity>
+template <int InputRows, int Capacity>
 void launch_ksplit(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t stream) {
-    using Geometry = Q4LinearGeometry<5120, 6144>;
+    using Geometry = Q4LinearGeometry<5120, InputRows>;
     auto* output   = static_cast<__nv_bfloat16*>(residual.data);
     q4_ksplit_mma_kernel<Geometry, (Capacity + 7) / 8 * 8, Capacity, KSplitResidualEpilogue,
                          Q4KSplitIdentityRows, true>
@@ -67,21 +74,40 @@ void launch_ksplit(const Tensor& x, const Weight& w, Tensor& residual, cudaStrea
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace
-
-Q4LinearAddLaunch select_q4_linear_add(std::int32_t rows, std::int32_t k, std::int32_t tokens) {
-    if (rows != 5120 || k != 6144 || tokens <= 0) {
-        throw std::invalid_argument("q4 linear_add: unsupported shape or token extent");
-    }
+Q4LinearAddLaunch select_q4_linear_add_5120_6144(std::int32_t tokens) {
     if (tokens == 1) return launch_q4_gemv<GemvR1W8, GemvResidualEpilogue>;
-    if (tokens <= 4) return launch_ksplit<4>;
-    if (tokens <= 8) return launch_ksplit<8>;
-    if (tokens <= 16) return launch_ksplit<16>;
-    if (tokens <= 24) return launch_ksplit<24>;
-    if (tokens <= 32) return launch_ksplit<32>;
+    if (tokens <= 4) return launch_ksplit<6144, 4>;
+    if (tokens <= 8) return launch_ksplit<6144, 8>;
+    if (tokens <= 16) return launch_ksplit<6144, 16>;
+    if (tokens <= 24) return launch_ksplit<6144, 24>;
+    if (tokens <= 32) return launch_ksplit<6144, 32>;
     if (tokens <= 96) return launch_q4_mma<MmaR32C32, ResidualEpilogue>;
     if (tokens <= 192) return launch_q4_mma<MmaR32C64, ResidualEpilogue>;
     return launch_q4_mma<MmaR64C128, ResidualEpilogue>;
+}
+
+Q4LinearAddLaunch select_q4_linear_add_5120_17408(std::int32_t tokens) {
+    if (tokens == 1) return launch_q4_gemv<GemvR1W8K17408, GemvResidualEpilogue>;
+    if (tokens <= 4) return launch_ksplit<17408, 4>;
+    if (tokens <= 8) return launch_ksplit<17408, 8>;
+    if (tokens <= 16) return launch_ksplit<17408, 16>;
+    if (tokens <= 24) return launch_ksplit<17408, 24>;
+    if (tokens <= 32) return launch_ksplit<17408, 32>;
+    if (tokens <= 96) return launch_q4_mma<MmaR32C32, ResidualEpilogue>;
+    if (tokens <= 192) return launch_q4_mma<MmaR32C64, ResidualEpilogue>;
+    return launch_q4_mma<MmaR64C128, ResidualEpilogue>;
+}
+
+} // namespace
+
+Q4LinearAddLaunch select_q4_linear_add(std::int32_t rows, std::int32_t k, std::int32_t tokens) {
+    if (tokens <= 0) {
+        throw std::invalid_argument("q4 linear_add: unsupported shape or token extent");
+    }
+    if (rows == 5120 && k == 6144) { return select_q4_linear_add_5120_6144(tokens); }
+    // Qwen3.8-27B mlp/down (hidden_size 5120, intermediate_size 17408).
+    if (rows == 5120 && k == 17408) { return select_q4_linear_add_5120_17408(tokens); }
+    throw std::invalid_argument("q4 linear_add: unsupported shape or token extent");
 }
 
 } // namespace ninfer::ops::detail

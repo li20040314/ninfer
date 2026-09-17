@@ -36,13 +36,32 @@ int verify_output_range(std::string_view label, const GuardedBf16Tensor& output,
     return compare(label, actual, expected, kGdnInputProjA16Tolerance);
 }
 
+// Logical GDN input-projection geometry under test. The numbers are stated independently of the
+// production geometry table so that a wrong production entry cannot make this test agree with
+// itself. The profiles differ in the activation width and in the value/z head widths; the query and
+// key widths are shared.
+struct GdnGeometry {
+    std::int32_t hidden;
+    std::int32_t qk_rows;
+    std::int32_t value_rows;
+    std::int32_t z_rows;
+
+    constexpr std::int32_t qkv_rows() const noexcept { return qk_rows + value_rows; }
+    constexpr std::int32_t value_z_rows() const noexcept { return value_rows + z_rows; }
+};
+
+// Qwen3.6/3.8 27B: 48 value heads, the tuned target.
+constexpr GdnGeometry kGdn27B{5120, 4096, 6144, 6144};
+// Qwen3.5 Small 9B: 32 value heads over hidden 4096, the Ada profile.
+constexpr GdnGeometry kGdn9B{4096, 4096, 4096, 4096};
+
 int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weight,
-                   std::int32_t tokens) {
-    constexpr std::int32_t kHidden      = 5120;
-    constexpr std::int32_t kQkRows      = 4096;
-    constexpr std::int32_t kValueRows   = 6144;
-    constexpr std::int32_t kZRows       = 6144;
-    constexpr std::int32_t kRows        = kQkRows + kValueRows;
+                   std::int32_t tokens, const GdnGeometry& geometry) {
+    const std::int32_t kHidden          = geometry.hidden;
+    const std::int32_t kQkRows          = geometry.qk_rows;
+    const std::int32_t kValueRows       = geometry.value_rows;
+    const std::int32_t kZRows           = geometry.z_rows;
+    const std::int32_t kRows            = geometry.qkv_rows();
     const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 401U + tokens);
     const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
     DeviceBuffer device_activation                   = to_device(activation_bits);
@@ -72,14 +91,25 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
 }
 
 int run_q4_q5() {
-    constexpr std::int32_t kHidden = 5120;
-    DevicePackedWeight query_key(
-        quantized_weight::make_patterned_weight(QType::Q4_G64_FP16, 4096, kHidden, 409U));
-    DevicePackedWeight value_z_weight(
-        quantized_weight::make_patterned_weight(QType::Q5_G64_FP16, 12288, kHidden, 419U));
     int failures = 0;
+    // The 27B profile is the tuned target and keeps its original sweep.
+    DevicePackedWeight query_key(quantized_weight::make_patterned_weight(
+        QType::Q4_G64_FP16, kGdn27B.qk_rows, kGdn27B.hidden, 409U));
+    DevicePackedWeight value_z_weight(quantized_weight::make_patterned_weight(
+        QType::Q5_G64_FP16, kGdn27B.value_z_rows(), kGdn27B.hidden, 419U));
     for (const std::int32_t tokens : {1, 2, 16, 17}) {
-        failures += run_q4_q5_case(query_key, value_z_weight, tokens);
+        failures += run_q4_q5_case(query_key, value_z_weight, tokens, kGdn27B);
+    }
+
+    // The 9B profile walks every independent route (decode, the T=4 programmatic pair, the split-4
+    // exact range, and the SIMT range) and both grouped MMA regions, which is where the new
+    // instantiations live.
+    DevicePackedWeight query_key_9b(quantized_weight::make_patterned_weight(
+        QType::Q4_G64_FP16, kGdn9B.qk_rows, kGdn9B.hidden, 421U));
+    DevicePackedWeight value_z_9b(quantized_weight::make_patterned_weight(
+        QType::Q5_G64_FP16, kGdn9B.value_z_rows(), kGdn9B.hidden, 431U));
+    for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 7, 9, 15, 16, 17, 33}) {
+        failures += run_q4_q5_case(query_key_9b, value_z_9b, tokens, kGdn9B);
     }
     return failures;
 }
@@ -330,7 +360,13 @@ int main() {
     int failures = 0;
     failures += run_q4_q5();
     failures += run_q8();
+    // NVFP4 is a Blackwell weight format. A build without the kernels rejects an NVFP4 weight while
+    // it is validated instead of computing with some other format, so there is no target to compare.
+#if NINFER_ENABLE_NVFP4
     failures += run_nvfp4();
+#else
+    std::cout << "SKIP: nvfp4 gdn_input_proj targets need an NVFP4 build\n";
+#endif
     failures += run_fp8();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj\n";
     return failures == 0 ? 0 : 1;

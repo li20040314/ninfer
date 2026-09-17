@@ -330,6 +330,17 @@ ninfer_add_linear_test(ninfer_linear_nvfp4_a16_test ops/linear/test_nvfp4_a16.cp
 ninfer_add_linear_test(ninfer_linear_nvfp4_a4_test ops/linear/test_nvfp4_a4.cpp)
 ninfer_add_linear_test(ninfer_linear_fp8_a16_test ops/linear/test_fp8_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_fp8_a8_test ops/linear/test_fp8_a8.cpp)
+# The host-side contraction of the same RowSplit formats. Deliberately not a linear_test_common
+# target: it needs no device, and its oracle is the fixture's own decoder rather than the op under
+# test, so it stays a plain op test.
+ninfer_add_op_test(ninfer_linear_cpu_rowsplit_test
+  SOURCES ops/cpu/test_rowsplit_gemm_cpu.cpp
+  LIBRARIES ninfer_ops)
+# The host contraction as the engine reaches it: a host weight through the public `linear()` entry,
+# with the dispatch choosing the CPU on its own. Needs a device only to hold the activation.
+ninfer_add_op_test(ninfer_linear_host_cpu_test
+  SOURCES ops/linear/test_linear_host.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_linear_bf16_a16_test
   SOURCES ops/linear/test_bf16_a16.cpp
   LIBRARIES ninfer_ops)

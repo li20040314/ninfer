@@ -3,13 +3,19 @@
 
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
+#if NINFER_ENABLE_NVFP4
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
+#endif
+#include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_geometry.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/attn_input_proj/q8/q8_attn_input_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/host/linear_host.h"
+#if NINFER_ENABLE_NVFP4
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#endif
 
 #include <cstddef>
 #include <cstdint>
@@ -31,16 +37,17 @@ void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t cols, 
     }
 }
 
-void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, const char* label) {
+void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, std::int32_t hidden,
+                      const char* label) {
     const bool q4_planes =
         qtype != QType::Q4_G64_FP16 || (weight.qhigh == nullptr && weight.high_plane_bytes == 0);
     const bool q5_planes =
         qtype != QType::Q5_G64_FP16 || (weight.qhigh != nullptr && weight.high_plane_bytes != 0);
     if (weight.qtype != qtype || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group_size != 64 || weight.group != 64 ||
-        weight.ndim != 2 || weight.n != rows || weight.k != 5120 || weight.shape[0] != rows ||
-        weight.shape[1] != 5120 || weight.padded_shape[0] != rows ||
-        weight.padded_shape[1] != 5120 || !q4_planes || !q5_planes ||
+        weight.ndim != 2 || weight.n != rows || weight.k != hidden || weight.shape[0] != rows ||
+        weight.shape[1] != hidden || weight.padded_shape[0] != rows ||
+        weight.padded_shape[1] != hidden || !q4_planes || !q5_planes ||
         !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 4) ||
         (qtype == QType::Q5_G64_FP16 && !aligned_to(weight.qhigh, 16))) {
         throw std::invalid_argument(std::string("attn_input_proj: invalid ") + label);
@@ -106,6 +113,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     }
 
     if (weight.qtype == QType::NVFP4) {
+#if NINFER_ENABLE_NVFP4
         constexpr std::int32_t kHidden = 5120;
         constexpr std::int32_t kQRows  = 6144;
         constexpr std::int32_t kKvRows = 1024;
@@ -123,6 +131,10 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         }
         detail::nvfp4_attn_input_dispatch(x, weight, q, gate, k, v, policy, workspace, stream);
         return;
+#else
+        throw std::invalid_argument(
+            "attn_input_proj: NVFP4 weights require a Blackwell (sm_100+/sm_120+) build");
+#endif
     }
 
     if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16) {
@@ -178,11 +190,16 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         }
         return 0;
     case QType::NVFP4:
+#if NINFER_ENABLE_NVFP4
         if (parent_rows != detail::Nvfp4N14336K5120::kOutputRows ||
             input_rows != detail::Nvfp4N14336K5120::kInputRows) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported NVFP4 profile");
         }
         return detail::nvfp4_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+#else
+        throw std::invalid_argument(
+            "attn_input_proj workspace: NVFP4 weights require a Blackwell (sm_100+/sm_120+) build");
+#endif
     case QType::FP8_E4M3FN_ROW_BF16:
         if (parent_rows != detail::Fp8N14336K5120::kOutputRows ||
             input_rows != detail::Fp8N14336K5120::kInputRows) {
@@ -211,17 +228,32 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                      cudaStream_t stream) {
-    constexpr std::int32_t kHidden = 5120;
-    constexpr std::int32_t kQRows  = 6144;
-    constexpr std::int32_t kKvRows = 1024;
-    const std::int32_t cols        = x.ne[1];
-    require_matrix(x, kHidden, cols, "x");
-    require_matrix(q, kQRows, cols, "q");
-    require_matrix(gate, kQRows, cols, "gate");
-    require_matrix(k, kKvRows, cols, "k");
-    require_matrix(v, kKvRows, cols, "v");
-    require_rowsplit(query_key_weight, QType::Q4_G64_FP16, kQRows + kKvRows, "query/key weight");
-    require_rowsplit(gate_value_weight, QType::Q5_G64_FP16, kQRows + kKvRows, "gate/value weight");
+    const std::int32_t cols = x.ne[1];
+    if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
+    // The two fused parents carry `query + key` and `gate + value` rows, so their row count and
+    // the activation width together identify the profile.
+    const detail::Q4Q5AttnInputGeometry geometry =
+        detail::q4_q5_attn_input_geometry(query_key_weight.n, x.ne[0]);
+    if (geometry.input_rows == 0) {
+        throw std::invalid_argument("attn_input_proj: unsupported fused projection geometry");
+    }
+    require_matrix(x, geometry.input_rows, cols, "x");
+    require_matrix(q, geometry.query_rows, cols, "q");
+    require_matrix(gate, geometry.query_rows, cols, "gate");
+    require_matrix(k, geometry.kv_rows, cols, "k");
+    require_matrix(v, geometry.kv_rows, cols, "v");
+    require_rowsplit(query_key_weight, QType::Q4_G64_FP16, geometry.fused_rows(), geometry.padded_k,
+                     "query/key weight");
+    require_rowsplit(gate_value_weight, QType::Q5_G64_FP16, geometry.fused_rows(), geometry.padded_k,
+                     "gate/value weight");
+
+    // Host-resident parents (the `--host-linear` offload mode) are contracted on the CPU; the
+    // device routes below would dereference host pointers and fault.
+    if (detail::weight_is_host_resident(query_key_weight) &&
+        detail::weight_is_host_resident(gate_value_weight)) {
+        detail::attn_input_proj_host(x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
+        return;
+    }
 
     detail::q4_q5_attn_input_dispatch(x, query_key_weight, gate_value_weight, q, gate, k, v,
                                       stream);

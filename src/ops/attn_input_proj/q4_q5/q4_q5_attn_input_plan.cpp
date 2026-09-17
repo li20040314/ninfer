@@ -1,6 +1,7 @@
 #include "core/weight.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 
+#include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_geometry.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h"
 #include <stdexcept>
 
@@ -8,8 +9,14 @@ namespace ninfer::ops::detail {
 namespace {
 
 bool supported_shape(const Q4Q5AttnInputProblem& problem) noexcept {
-    return problem.input_rows == 5120 && problem.query_rows == 6144 && problem.kv_rows == 1024 &&
-           problem.padded_k == 5120;
+    for (const Q4Q5AttnInputGeometry& geometry : kQ4Q5AttnInputGeometries) {
+        if (problem.input_rows == geometry.input_rows &&
+            problem.query_rows == geometry.query_rows && problem.kv_rows == geometry.kv_rows &&
+            problem.padded_k == geometry.padded_k) {
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace

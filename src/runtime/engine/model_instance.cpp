@@ -57,6 +57,46 @@ void validate_options(const EngineOptions& options) {
     if (options.media_preprocess_threads > 64) {
         throw std::invalid_argument("Engine media_preprocess_threads must be in [0,64]");
     }
+    if (options.weight_offload_ratio < 0.0F || options.weight_offload_ratio >= 1.0F) {
+        throw std::invalid_argument("Engine weight_offload_ratio must be in [0,1)");
+    }
+    // host_linear selects what happens to the streamed suffix -- it does not define the split. With
+    // no ratio there is no suffix, so accepting it silently would look like a ~3x switch that did
+    // nothing at all.
+    if (options.host_linear && options.weight_offload_ratio == 0.0F) {
+        throw std::invalid_argument(
+            "Engine host_linear requires weight_offload_ratio to select the streamed layers");
+    }
+    // MTP's verify pass contracts every draft token through the same layers the CPU route now
+    // serves, so the host work scales with the draft length: at the measured 2.04 acceptance rate
+    // the doubled contraction cost cancels the accepted tokens exactly, leaving latency worse by
+    // the verify overhead. The streaming path amortizes its PCIe payload the same way but its
+    // bottleneck is the copy engine, which verify does not enlarge -- hence the asymmetry.
+    if (options.host_linear && options.speculative.backend != SpeculativeBackend::None) {
+        throw std::invalid_argument(
+            "Engine host_linear is not compatible with speculative decoding; the CPU contraction "
+            "already dominates the step and verify would multiply it by the draft length");
+    }
+    if (options.weight_offload_ratio > 0.0F) {
+        if (options.purpose != EnginePurpose::Generation) {
+            throw std::invalid_argument(
+                "Engine weight offload currently requires the Generation purpose");
+        }
+        // MTP shares the offload traffic problem instead of fighting it: one streamed pass
+        // verifies several draft tokens, so the PCIe payload is amortized across them. Its own
+        // weights (input projection, three norms, one block) are not text layers, so the offload
+        // plan leaves them device resident and the draft pass costs no host traffic. Draft-model
+        // backends load a whole separate model whose layers are never offloaded, so they stay
+        // rejected until they are measured against the offload budget.
+        switch (options.speculative.backend) {
+        case SpeculativeBackend::None:
+        case SpeculativeBackend::Mtp:
+            break;
+        default:
+            throw std::invalid_argument(
+                "Engine weight offload is not compatible with draft-model speculative backends");
+        }
+    }
 }
 
 std::size_t current_free_device_bytes() {
@@ -88,6 +128,8 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
+    // P0 streams weights with synchronous host copies outside any capture; graphs are excluded.
+    if (options.weight_offload_ratio > 0.0F) { options.use_cuda_graph = false; }
 
     ContextCacheOptions& cache      = options.context_cache;
     const std::uint32_t concurrency = options.max_concurrency;

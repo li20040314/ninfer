@@ -428,7 +428,21 @@ Q8PairPlan q8_pair_resolve_plan(const Q8PairProblem& problem) {
         }
         throw std::logic_error("q8 pair: admitted problem has no covering route");
     };
-    return problem.k == 2048 ? resolve_from(kK2048Routes) : resolve_from(kK5120Routes);
+    const Q8PairPlan plan =
+        problem.k == 2048 ? resolve_from(kK2048Routes) : resolve_from(kK5120Routes);
+#if !NINFER_ENABLE_LARGE_STATIC_SMEM
+    // The medium split-K routes are the only entries in this catalog whose K-split staging
+    // exceeds the 48 KiB of static shared memory this architecture allows
+    // (q8_pair_splitk_medium_launch reports the same limitation). Reject them while the plan is
+    // still being formed rather than at the first launch.
+    if (plan.schedule >= Q8PairScheduleId::DualSplitKMediumC48 &&
+        plan.schedule <= Q8PairScheduleId::DualSplitKMediumC256) {
+        throw std::invalid_argument(
+            "q8 pair: medium split-K needs more than the 48 KiB of static shared memory this "
+            "architecture allows");
+    }
+#endif
+    return plan;
 }
 
 namespace {

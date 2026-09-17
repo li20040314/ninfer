@@ -138,9 +138,20 @@ Q8AttnInputPlan q8_attn_input_resolve_plan(const Q8AttnInputProblem& problem) {
         }
         throw std::logic_error("Q8 attention input: admitted problem has no covering route");
     };
-    if (is_dflash2_shape(problem)) { return resolve_from(kDFlash2Routes); }
-    if (is_companion_shape(problem)) { return resolve_from(kCompanionRoutes); }
-    return resolve_from(kTargetRoutes);
+    const Q8AttnInputPlan plan = is_dflash2_shape(problem)      ? resolve_from(kDFlash2Routes)
+                                 : is_companion_shape(problem) ? resolve_from(kCompanionRoutes)
+                                                               : resolve_from(kTargetRoutes);
+#if !NINFER_ENABLE_LARGE_STATIC_SMEM
+    // The split-K route is the only one that stages more than the 48 KiB of static shared memory
+    // this architecture allows; the dflash2 catalog is a different kernel family and stays
+    // available. Reject it while the plan is still being formed.
+    if (plan.schedule == Q8AttnInputScheduleId::SplitKMmaDirect) {
+        throw std::invalid_argument(
+            "Q8 attention input: split-K MMA needs more than the 48 KiB of static shared memory "
+            "this architecture allows");
+    }
+#endif
+    return plan;
 }
 
 void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, const Weight& weight,

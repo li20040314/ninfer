@@ -5,6 +5,8 @@
 #include "ops/common/math.h"
 #include "ops/linear/q8/q8_rowsplit_gemm_mma.cuh"
 
+#include <stdexcept>
+
 namespace ninfer::ops::detail {
 namespace {
 
@@ -116,10 +118,21 @@ void q8_dflash2_linear_swiglu_mma_r64_c80_k128_launch(const Tensor& x, const Wei
     launch_route<Schedule>(x, w, out, stream);
 }
 
+#if NINFER_ENABLE_LARGE_STATIC_SMEM
 void q8_dflash2_linear_swiglu_mma_r64_c96_k128_launch(const Tensor& x, const Weight& w, Tensor& out,
                                                       cudaStream_t stream) {
     using Schedule = Q8RowSplitMmaGemmSchedule<64, 96, 64, 8, 2, 2, 128, 1>;
     launch_route<Schedule>(x, w, out, stream);
 }
+#else
+// This is the only schedule in the unit that stages more than the 48 KiB of static __shared__
+// this target allows; the other fourteen entry points remain available.
+void q8_dflash2_linear_swiglu_mma_r64_c96_k128_launch(const Tensor&, const Weight&, Tensor&,
+                                                      cudaStream_t) {
+    throw std::invalid_argument(
+        "q8 dflash2 linear_swiglu r64_c96_k128: unavailable on this architecture "
+        "(static shared memory limit)");
+}
+#endif
 
 } // namespace ninfer::ops::detail

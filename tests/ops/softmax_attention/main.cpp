@@ -1,6 +1,10 @@
 #include <iostream>
 #include <string_view>
 
+// stderr is unbuffered, so a hard abort cannot swallow phase markers the way
+// buffered stdout can (fast-fail diagnostics).
+#define NINFER_ATTN_PHASE(name) std::cerr << "[phase] " name "\n"
+
 int run_softmax_attention_causal_cache_tests();
 int run_softmax_attention_dflash2_tests();
 int run_softmax_attention_nvfp4_tests();
@@ -9,12 +13,16 @@ int run_softmax_attention_plain_and_packed_tests();
 int run_softmax_attention_context_tests();
 
 int main(int argc, char** argv) {
-    if (argc == 2 && std::string_view(argv[1]) == "--dflash2-only")
+    if (argc == 2 && std::string_view(argv[1]) == "--dflash2-only") {
+        NINFER_ATTN_PHASE("dflash2");
         return run_softmax_attention_dflash2_tests();
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--nvfp4-only") {
+        NINFER_ATTN_PHASE("nvfp4");
         return run_softmax_attention_nvfp4_tests();
     }
     if (argc == 2 && std::string_view(argv[1]) == "--k8v4-only") {
+        NINFER_ATTN_PHASE("k8v4");
         return run_softmax_attention_k8v4_tests();
     }
     if (argc != 1) {
@@ -22,12 +30,15 @@ int main(int argc, char** argv) {
             << "usage: ninfer_softmax_attention_test [--dflash2-only|--nvfp4-only|--k8v4-only]\n";
         return 2;
     }
+    NINFER_ATTN_PHASE("causal_cache");
     const int causal = run_softmax_attention_causal_cache_tests();
     if (causal == 77) return 77;
 
+    NINFER_ATTN_PHASE("plain_and_packed");
     const int plain_and_packed = run_softmax_attention_plain_and_packed_tests();
     if (plain_and_packed == 77) return 77;
 
+    NINFER_ATTN_PHASE("context");
     const int context = run_softmax_attention_context_tests();
     if (context == 77) return 77;
 

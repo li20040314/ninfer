@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "ops/linear_swiglu/q4/q4_linear_swiglu_geometry.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 
 #include "ninfer/ops/linear.h"
@@ -30,7 +31,8 @@ struct RouteSpec {
     Q4LinearSwiGluScheduleId schedule;
 };
 
-constexpr Q4LinearSwiGluProblem kShape{34816, 17408, 5120, 5120, 1};
+// The registered Q4 LinearSwiGLU problems: Qwen3.6/3.8 27B and Qwen3.5 Small 9B. Both kernels that
+// bake the geometry take their numbers from this table's entries.
 
 constexpr std::array<RouteSpec, 10> kRoutes{{
     {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
@@ -58,9 +60,13 @@ constexpr bool catalog_is_closed() noexcept {
 static_assert(catalog_is_closed(), "Q4 LinearSwiGLU routes must be exact, contiguous, and closed");
 
 bool supported_shape(const Q4LinearSwiGluProblem& problem) noexcept {
-    return problem.gate_up_rows == kShape.gate_up_rows &&
-           problem.output_rows == kShape.output_rows && problem.k == kShape.k &&
-           problem.padded_k == kShape.padded_k;
+    for (const Q4SwiGluGeometry& geometry : kQ4SwiGluGeometries) {
+        if (q4_swiglu_geometry_matches(geometry, problem.gate_up_rows, problem.output_rows,
+                                       problem.k, problem.padded_k)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 template <class Allocator>

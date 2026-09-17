@@ -257,21 +257,70 @@ void require_shape35(const Weight& w, const char* name) {
     }
 }
 
+void require_shape9(const Weight& w, const char* name) {
+    constexpr int k9N = 32;
+    constexpr int k9K = 4096;
+    if (w.n != k9N || w.k != k9K || w.shape[0] != k9N || w.shape[1] != k9K) {
+        throw std::invalid_argument(std::string("gdn_gating_proj: ") + name +
+                                    " requires contiguous BF16 [32,4096]");
+    }
+}
+
+// The largest number of resident CTAs per SM measured on the sm_120a tuning target. It is an upper
+// bound for other devices, not a device-wide policy: see resident_ctas_per_sm below.
 template <class Geometry, int SplitK>
-constexpr std::int32_t cooperative_resident_ctas_per_sm() noexcept {
+constexpr std::int32_t qualified_resident_ctas_per_sm() noexcept {
     static_assert(SplitK > 1);
     if constexpr (std::is_same_v<Geometry, Bf16Gdn27Geometry>) {
         static_assert(SplitK == 8 || SplitK == 4 || SplitK == 2);
         // Qualified on the sm_120a build: BN128 split-8 uses 256 threads and split-4/2 use
         // 512 threads; registers and 40-KiB shared memory admit two resident CTAs per SM.
         return 2;
+    } else if constexpr (std::is_same_v<Geometry, Bf16Gdn9Geometry>) {
+        static_assert(SplitK == 16 || SplitK == 8 || SplitK == 4 || SplitK == 2);
+        // Same CTA shape as 35B (BN64, 256 threads, 24-KiB shared memory), so the 35B
+        // qualified values carry over as upper bounds until measured on a tuning target.
+        return 4;
     } else {
         static_assert(std::is_same_v<Geometry, Bf16Gdn35Geometry>);
         static_assert(SplitK == 32 || SplitK == 16 || SplitK == 8 || SplitK == 4 || SplitK == 2);
         // BN64 split-32 is register-limited to two resident CTAs per SM. The remaining
-        // specializations admit four. These are kernel facts, not a device-wide SM-count policy.
+        // specializations admit four.
         return SplitK == 32 ? 2 : 4;
     }
+}
+
+// A cooperative launch fails with cudaErrorCooperativeLaunchTooLarge when its grid exceeds the CTAs
+// the device can keep co-resident, so that count must come from the device rather than from a
+// constant qualified on one architecture. sm_89 admits 1536 threads per SM where sm_120a admits
+// 2048, so a 512-thread specialization that really does fit four CTAs per SM on the tuning target
+// fits only three here, and the four-CTA grid its token tile count assumes overflows.
+//
+// The qualified number stays an upper bound, so a device that reaches it keeps exactly the grid it
+// was tuned with; only devices that cannot reach it split into more, smaller launches.
+template <class Geometry, int SplitK, int Warps, bool NormalizeInput, int NormTokenCapacity>
+int resident_ctas_per_sm(int block_threads, int dynamic_smem_bytes) noexcept {
+    int limit = qualified_resident_ctas_per_sm<Geometry, SplitK>();
+
+    int full_blocks = 0;
+    const cudaError_t full_status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &full_blocks,
+        bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, true, Warps, NormalizeInput,
+                                             NormTokenCapacity>,
+        block_threads, dynamic_smem_bytes);
+    if (full_status == cudaSuccess && full_blocks > 0) { limit = std::min(limit, full_blocks); }
+
+    // The predicated token variant is a separate instantiation and may differ in registers.
+    int predicated_blocks = 0;
+    const cudaError_t predicated_status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &predicated_blocks,
+        bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, false, Warps, NormalizeInput,
+                                             NormTokenCapacity>,
+        block_threads, dynamic_smem_bytes);
+    if (predicated_status == cudaSuccess && predicated_blocks > 0) {
+        limit = std::min(limit, predicated_blocks);
+    }
+    return limit;
 }
 
 template <class Geometry, int SplitK, int Warps = kBf16GdnWarps, bool NormalizeInput = false,
@@ -357,10 +406,11 @@ bool launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
     } else {
         constexpr std::int64_t kCtasPerTokenTile =
             static_cast<std::int64_t>(Geometry::kHeads / kBf16GdnBlockM) * SplitK;
-        constexpr std::int32_t kResidentCtasPerSm =
-            cooperative_resident_ctas_per_sm<Geometry, SplitK>();
+        const std::int32_t resident_per_sm =
+            resident_ctas_per_sm<Geometry, SplitK, Warps, NormalizeInput, NormTokenCapacity>(
+                Warps * 32, kSmemBytes);
         const std::int64_t resident_ctas =
-            static_cast<std::int64_t>(multiprocessor_count) * kResidentCtasPerSm;
+            static_cast<std::int64_t>(multiprocessor_count) * resident_per_sm;
         const std::int64_t max_token_tiles = resident_ctas / kCtasPerTokenTile;
         if (max_token_tiles < 1) { return false; }
 
@@ -623,6 +673,69 @@ void bf16_gdn_gating_proj_35_mma_unsplit_launch(Bf16GdnGatingTokenVariant varian
     (void)launch_bf16_prefill_mma<Bf16Gdn35Geometry, 1, 8>(variant, x, nullptr, 0.0F, nullptr,
                                                            a_weight, b_weight, A_log, dt_bias,
                                                            nullptr, g, beta, stream);
+}
+
+bool bf16_gdn_gating_proj_9_mma_split16_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+                                               const Weight& a_weight, const Weight& b_weight,
+                                               const Tensor& A_log, const Tensor& dt_bias,
+                                               void* workspace, Tensor& g, Tensor& beta,
+                                               std::int32_t multiprocessor_count,
+                                               cudaStream_t stream) {
+    require_shape9(a_weight, "a_weight");
+    require_shape9(b_weight, "b_weight");
+    return launch_bf16_prefill_mma<Bf16Gdn9Geometry, 16, 8>(
+        variant, x, nullptr, 0.0F, nullptr, a_weight, b_weight, A_log, dt_bias, workspace, g, beta,
+        stream, multiprocessor_count);
+}
+
+bool bf16_gdn_gating_proj_9_mma_split8_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+                                              const Weight& a_weight, const Weight& b_weight,
+                                              const Tensor& A_log, const Tensor& dt_bias,
+                                              void* workspace, Tensor& g, Tensor& beta,
+                                              std::int32_t multiprocessor_count,
+                                              cudaStream_t stream) {
+    require_shape9(a_weight, "a_weight");
+    require_shape9(b_weight, "b_weight");
+    return launch_bf16_prefill_mma<Bf16Gdn9Geometry, 8, 8>(
+        variant, x, nullptr, 0.0F, nullptr, a_weight, b_weight, A_log, dt_bias, workspace, g, beta,
+        stream, multiprocessor_count);
+}
+
+bool bf16_gdn_gating_proj_9_mma_split4_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+                                              const Weight& a_weight, const Weight& b_weight,
+                                              const Tensor& A_log, const Tensor& dt_bias,
+                                              void* workspace, Tensor& g, Tensor& beta,
+                                              std::int32_t multiprocessor_count,
+                                              cudaStream_t stream) {
+    require_shape9(a_weight, "a_weight");
+    require_shape9(b_weight, "b_weight");
+    return launch_bf16_prefill_mma<Bf16Gdn9Geometry, 4, 8>(
+        variant, x, nullptr, 0.0F, nullptr, a_weight, b_weight, A_log, dt_bias, workspace, g, beta,
+        stream, multiprocessor_count);
+}
+
+bool bf16_gdn_gating_proj_9_mma_split2_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+                                              const Weight& a_weight, const Weight& b_weight,
+                                              const Tensor& A_log, const Tensor& dt_bias,
+                                              void* workspace, Tensor& g, Tensor& beta,
+                                              std::int32_t multiprocessor_count,
+                                              cudaStream_t stream) {
+    require_shape9(a_weight, "a_weight");
+    require_shape9(b_weight, "b_weight");
+    return launch_bf16_prefill_mma<Bf16Gdn9Geometry, 2, 8>(
+        variant, x, nullptr, 0.0F, nullptr, a_weight, b_weight, A_log, dt_bias, workspace, g, beta,
+        stream, multiprocessor_count);
+}
+
+void bf16_gdn_gating_proj_9_mma_unsplit_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+                                               const Weight& a_weight, const Weight& b_weight,
+                                               const Tensor& A_log, const Tensor& dt_bias,
+                                               Tensor& g, Tensor& beta, cudaStream_t stream) {
+    require_shape9(a_weight, "a_weight");
+    require_shape9(b_weight, "b_weight");
+    (void)launch_bf16_prefill_mma<Bf16Gdn9Geometry, 1, 8>(variant, x, nullptr, 0.0F, nullptr,
+                                                          a_weight, b_weight, A_log, dt_bias,
+                                                          nullptr, g, beta, stream);
 }
 
 } // namespace ninfer::ops::detail

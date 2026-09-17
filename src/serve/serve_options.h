@@ -47,6 +47,10 @@ struct ServeOptions {
     ContextCacheOptions context_cache;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;
+    float weight_offload_ratio = 0.0F; // --offload-ratio: stream this text-layer weight fraction
+    bool host_embedding        = false; // --host-embedding: gather the table from pinned host memory
+    bool host_output_head      = false; // --host-output-head: contract the head on the CPU
+    bool host_linear           = false; // --host-linear: contract the streamed layers on the CPU
     bool allow_prefix_reuse = true;
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)

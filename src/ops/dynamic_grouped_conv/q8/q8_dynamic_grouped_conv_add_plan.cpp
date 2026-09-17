@@ -15,6 +15,14 @@ Plan resolve_plan(int input_rows, int width, int batch) {
         throw std::invalid_argument("linear dynamic grouped conv add: C must be 4096 or 17408");
     if (width < 2 || width > 16 || batch < 1 || batch > 8)
         throw std::invalid_argument("linear dynamic grouped conv add: invalid W/B profile");
+#if !NINFER_ENABLE_LARGE_STATIC_SMEM
+    // Either production schedule reaches q8_dynamic_grouped_conv_add_materialized_launch, whose
+    // tiled projection stages more than the 48 KiB of static shared memory this architecture
+    // allows, so the whole route is unavailable here.
+    throw std::invalid_argument(
+        "linear dynamic grouped conv add (q8): unavailable on this architecture "
+        "(static shared memory limit)");
+#endif
     const int columns = width * batch;
     using S           = Q8DynamicConvAddSchedule;
     const S schedule  = columns <= 88 ? S::TiledMma : S::MmaK128;

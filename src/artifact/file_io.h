@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/platform.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -24,9 +26,9 @@ public:
 
 private:
     std::filesystem::path path_;
-    int fd_                = -1;
-    mutable int direct_fd_ = -1;
-    std::uint64_t bytes_   = 0;
+    platform::ReadHandle fd_;
+    mutable platform::ReadHandle direct_fd_;
+    std::uint64_t bytes_ = 0;
 };
 
 } // namespace ninfer::artifact

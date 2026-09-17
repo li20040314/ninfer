@@ -122,6 +122,51 @@ int q4_a16_conformance() {
     failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
                           {4304, 1152, 139U, Comparison::Sampled, false, kN4304K1152});
 
+    // Qwen3.5-9B (hidden_size 4096). These shapes route through launchers that derive n and k from
+    // the Weight at run time, so every ladder branch (t == 1, t <= 4, t <= 16, t > 16) is covered.
+    constexpr std::array kN1024K4096{
+        a16(1), a16(2), a16(3), a16(4), a16(5), a16(8), a16(16), a16(17), a16(128),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {1024, 4096, 211U, Comparison::Full, true, kN1024K4096});
+
+    constexpr std::array kN2048K4096{
+        a16(1), a16(4), a16(5), a16(16), a16(17), a16(128),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {2048, 4096, 223U, Comparison::Sampled, false, kN2048K4096});
+
+    constexpr std::array kN4096K4096{
+        a16(1), a16(4), a16(5), a16(16), a16(17), a16(128),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {4096, 4096, 227U, Comparison::Sampled, false, kN4096K4096});
+
+    constexpr std::array kN5120K4096{
+        a16(1), a16(4), a16(5), a16(16), a16(17), a16(128),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {5120, 4096, 229U, Comparison::Sampled, false, kN5120K4096});
+
+    constexpr std::array kN12288K4096{
+        a16(1), a16(4), a16(5), a16(16), a16(17), a16(128),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {12288, 4096, 233U, Comparison::Sampled, false, kN12288K4096});
+
+    constexpr std::array kN24576K4096{
+        a16(1), a16(4), a16(5), a16(16), a16(17), a16(128),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {24576, 4096, 239U, Comparison::Sampled, false, kN24576K4096});
+
+    failures += verify_workspace_envelopes(QType::Q4_G64_FP16, 1024, 4096);
+    failures += verify_workspace_envelopes(QType::Q4_G64_FP16, 2048, 4096);
+    failures += verify_workspace_envelopes(QType::Q4_G64_FP16, 4096, 4096);
+    failures += verify_workspace_envelopes(QType::Q4_G64_FP16, 5120, 4096);
+    failures += verify_workspace_envelopes(QType::Q4_G64_FP16, 12288, 4096);
+    failures += verify_workspace_envelopes(QType::Q4_G64_FP16, 24576, 4096);
+
     return failures;
 }
 

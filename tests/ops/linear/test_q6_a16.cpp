@@ -45,6 +45,18 @@ int q6_a16_conformance() {
     failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6_g64_fp16_weight,
                           {1152, 1536, 197U, Comparison::Sampled, false, kN1152K1536Large});
 
+    // Qwen3.5-9B (hidden_size 4096). The `_k128` schedules are driven by the runtime padded_k
+    // (`k_tiles = padded_k / kBlockK`), so k = 4096 exercises the same ladder as the k = 5120
+    // sibling; every branch is covered.
+    constexpr std::array kN248320K4096{
+        a16(1),  a16(2),  a16(4),  a16(5),  a16(6),  a16(7),  a16(8),  a16(16),
+        a16(17), a16(24), a16(25), a16(32), a16(33), a16(48), a16(49), a16(128),
+    };
+    failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6_g64_fp16_weight,
+                          {248320, 4096, 271U, Comparison::Sampled, false, kN248320K4096});
+
+    failures += verify_workspace_envelopes(ninfer::QType::Q6_G64_FP16, 248320, 4096);
+
     return failures;
 }
 

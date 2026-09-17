@@ -1,7 +1,11 @@
 #include "ops/linear/q8/q8_shapes.h"
 #include "ops/linear/q8/q8_ksplit_launch.cuh"
 
+#include <stdexcept>
+
 namespace ninfer::ops::detail {
+
+#if NINFER_ENABLE_LARGE_STATIC_SMEM
 namespace {
 using Geometry = Q8N2048K4096;
 using Access   = Q8KSplitScaleAccess;
@@ -30,5 +34,14 @@ Q8Launch select_q8_n2048_k4096(std::int32_t tokens) {
     if (tokens < 896) return launch_q8_mma_r32_c128;
     return launch_q8_mma_r64_c128;
 }
+
+#else
+// The schedules registered for this geometry stage more than the 48 KiB of static __shared__
+// this target allows, so the shape is not registered and the dispatcher reports it unsupported.
+Q8Launch select_q8_n2048_k4096(std::int32_t) {
+    throw std::invalid_argument(
+        "q8 linear n2048 k4096: unavailable on this architecture (static shared memory limit)");
+}
+#endif
 
 } // namespace ninfer::ops::detail

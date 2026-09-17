@@ -113,6 +113,7 @@ struct Geometry {
 constexpr Geometry kGeometries[] = {
     {"d256-h24-kv4", 24, 4},
     {"d256-h16-kv2", 16, 2},
+    {"d256-h16-kv4", 16, 4}, // Qwen3.5-9B full-attention layers.
 };
 
 ops::AttentionHeadGeometry op_geometry(const Geometry& geometry) {
@@ -2168,8 +2169,11 @@ int run_dflash2_cases() {
     constexpr int order[]{7, 0, 4, 2, 6, 1, 5, 3};
     int failures = 0;
     for (auto storage :
-         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256
+#if NINFER_ENABLE_NVFP4
+          , KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value
+#endif
+         }) {
         const auto run = [&](int width, int batch, int base, bool graph) {
             BatchAttentionCase c{width,
                                  {},
@@ -2211,9 +2215,12 @@ int run_dflash2_cases() {
 
 int run_batch_cases() {
     int failures = 0;
-    for (auto storage :
-         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+        for (auto storage :
+             {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256
+#if NINFER_ENABLE_NVFP4
+              , KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value
+#endif
+             }) {
         failures += run_batch_case(kGeometries[0], storage,
                                    {16, {0}, {0}, {0}, MappingPattern::Fragmented, 1501u});
         failures += run_batch_case(kGeometries[0], storage,
@@ -2389,8 +2396,11 @@ int run_k8v4_cases() {
 int verify_workspace_capacity_contract() {
     int failures = 0;
     for (const KvCacheStorage storage :
-         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256
+#if NINFER_ENABLE_NVFP4
+          , KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value
+#endif
+         }) {
         constexpr ops::CausalAttentionExecutionEnvelope envelope{1, 1025};
         constexpr ops::AttentionHeadGeometry geometry{kHeadDim, 16, 2};
         const std::size_t interval = ops::causal_softmax_attention_workspace_capacity_bytes(
@@ -2426,6 +2436,10 @@ int verify_workspace_capacity_contract() {
 } // namespace
 
 int run_softmax_attention_nvfp4_tests() {
+#if !NINFER_ENABLE_NVFP4
+    std::cout << "SKIP: NVFP4 attention requires a Blackwell (sm_100+/sm_120+) build\n";
+    return 77;
+#else
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
@@ -2436,9 +2450,14 @@ int run_softmax_attention_nvfp4_tests() {
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " causal_softmax_attention nvfp4 independent correctness\n";
     return failures == 0 ? 0 : 1;
+#endif
 }
 
 int run_softmax_attention_k8v4_tests() {
+#if !NINFER_ENABLE_NVFP4
+    std::cout << "SKIP: k8v4 attention requires a Blackwell (sm_100+/sm_120+) build\n";
+    return 77;
+#else
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
@@ -2449,6 +2468,7 @@ int run_softmax_attention_k8v4_tests() {
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " causal_softmax_attention k8v4 independent correctness\n";
     return failures == 0 ? 0 : 1;
+#endif
 }
 
 int run_softmax_attention_causal_cache_tests() {
@@ -2458,12 +2478,14 @@ int run_softmax_attention_causal_cache_tests() {
     }
 
     int failures = verify_workspace_capacity_contract();
+#if NINFER_ENABLE_NVFP4
     failures += run_nvfp4_cases();
     failures += run_quantized_batch_cases(KvCacheStorage::Nvfp4Group16, 720u);
     failures += report_quantization_quality(KvCacheStorage::Nvfp4Group16, 724u);
     failures += run_k8v4_cases();
     failures += run_quantized_batch_cases(KvCacheStorage::Fp8KeyNvfp4Value, 815u);
     failures += report_quantization_quality(KvCacheStorage::Fp8KeyNvfp4Value, 819u);
+#endif
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
     failures += run_fp8_cases();
     failures += run_batch_cases();

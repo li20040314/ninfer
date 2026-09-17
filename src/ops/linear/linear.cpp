@@ -3,7 +3,10 @@
 
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
+#include "ops/linear/host/linear_host.h"
+#if NINFER_ENABLE_NVFP4
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
+#endif
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
@@ -76,6 +79,14 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
 
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      WorkspaceArena* workspace, cudaStream_t stream) {
+    // A host-resident weight has no device kernel to launch: the contraction runs on the CPU and the
+    // activation crosses the bus instead of the weight. Checked ahead of the format switch because
+    // it applies to every quantized format the CPU contraction covers, and it is what lets the
+    // offload path keep a layer on the host without every consumer knowing where its weights went.
+    if (detail::weight_is_host_resident(w)) {
+        detail::linear_host(x, w, out, stream);
+        return;
+    }
     switch (w.qtype) {
     case QType::Q4_G64_FP16:
         detail::q4_dispatch(x, w, out, policy, stream);
@@ -93,8 +104,13 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::bf16_dispatch(x, w, out, policy, stream);
         return;
     case QType::NVFP4:
+#if NINFER_ENABLE_NVFP4
         detail::nvfp4_dispatch(x, w, out, policy, workspace, stream);
         return;
+#else
+        throw std::invalid_argument(
+            "linear: NVFP4 weights require a Blackwell (sm_100+/sm_120+) build");
+#endif
     case QType::FP8_E4M3FN_ROW_BF16:
         detail::fp8_dispatch(x, w, out, policy, workspace, stream);
         return;
@@ -137,8 +153,13 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         (void)detail::select_bf16_launch(output_rows, input_rows, max_tokens, policy);
         return 0;
     case QType::NVFP4:
+#if NINFER_ENABLE_NVFP4
         return detail::nvfp4_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                              min_tokens, max_tokens);
+#else
+        throw std::invalid_argument(
+            "linear workspace: NVFP4 weights require a Blackwell (sm_100+/sm_120+) build");
+#endif
     case QType::FP8_E4M3FN_ROW_BF16:
         return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                            min_tokens, max_tokens);

@@ -59,6 +59,17 @@ struct PagedKVStorageLayout {
                                                                   std::int32_t head_dim) {
     if (head_dim <= 0) { throw std::invalid_argument("KV-cache head dimension must be positive"); }
 
+    // Both FP4 storages encode with cvt.e2m1x2 / the .kind::mxf4nvf4 MMA, which ptxas rejects
+    // below sm_100a. Rejecting here keeps a Blackwell-produced artifact from selecting a storage
+    // whose kernels this build does not contain. Checked before the geometry switch so the
+    // failure names the architecture rather than an unsupported head dimension.
+#if defined(NINFER_ENABLE_NVFP4) && !NINFER_ENABLE_NVFP4
+    if (storage == KvCacheStorage::Nvfp4Group16 || storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+        throw std::invalid_argument(
+            "KV-cache FP4 storage requires a Blackwell (sm_100+/sm_120+) build");
+    }
+#endif
+
     const auto symmetric = [=](PagedKVVectorLayout vector) {
         return PagedKVStorageLayout{storage, head_dim, vector, vector};
     };

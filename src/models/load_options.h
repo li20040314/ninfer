@@ -11,6 +11,20 @@ struct LoadOptions {
     bool vision                    = false;
     SpeculativeBackend speculative = SpeculativeBackend::None;
     ProposalHead proposal_head     = ProposalHead::Full;
+    float weight_offload_ratio     = 0.0F;
+    // Keep the text embedding table in page-locked host memory, where the row gather reads it
+    // directly, instead of pinning its whole footprint in device memory. Only meaningful with
+    // weight_offload_ratio set: the freed bytes are handed to the streaming layers.
+    bool host_embedding            = false;
+    // Contract the output head on the CPU from host memory rather than keeping it device resident.
+    // Like host_embedding it only takes effect with weight_offload_ratio set, because the point is
+    // to hand the freed device bytes to the streaming layers.
+    bool host_output_head          = false;
+    // Contract the layers the ratio would otherwise stream on the CPU instead of uploading their
+    // weights. Same dependency as host_output_head -- the point is the device bytes it frees and
+    // the PCIe traffic it removes -- but it applies to the whole streamed suffix rather than one
+    // parameter, so it is the switch that turns the offload path into a CPU-compute path.
+    bool host_linear               = false;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -53,10 +67,14 @@ struct LoadOptions {
 }
 
 [[nodiscard]] inline LoadOptions load_options(const EngineOptions& options) noexcept {
-    return {.purpose       = options.purpose,
-            .vision        = options.enable_vision,
-            .speculative   = options.speculative.backend,
-            .proposal_head = options.speculative.proposal_head};
+    return {.purpose             = options.purpose,
+            .vision              = options.enable_vision,
+            .speculative         = options.speculative.backend,
+            .proposal_head       = options.speculative.proposal_head,
+            .weight_offload_ratio = options.weight_offload_ratio,
+            .host_embedding       = options.host_embedding,
+            .host_output_head     = options.host_output_head,
+            .host_linear          = options.host_linear};
 }
 
 } // namespace ninfer::models

@@ -1,12 +1,13 @@
 #pragma once
 
-// SM120 BF16 GDN gating projection for the two exact registered geometries:
+// SM120 BF16 GDN gating projection for the exact registered geometries:
 //
 //   Qwen3.6-27B:     a/b = W[48,5120] @ x[5120,T]
 //   Qwen3.6-35B-A3B: a/b = W[32,2048] @ x[2048,T]
+//   Qwen3.5-9B:      a/b = W[32,4096] @ x[4096,T]
 //
 // A CTA computes the same 16 output rows from both weights over 128 (27B) or
-// 64 (35B) tokens.
+// 64 (35B and 9B) tokens.
 // Split-K routes use a tuned eight- or sixteen-warp specialization and an
 // in-kernel cooperative grid reduction; the unsplit long-context route uses
 // eight warps for more independent MMA accumulators. One cooperative launch remains fused, while
@@ -48,8 +49,17 @@ struct Bf16Gdn35Geometry {
     static constexpr int kBlockN = 64;
 };
 
+// Qwen3.5-9B reuses the 35B CTA shape (BN64, two head tiles, eight warps) with twice the K
+// depth, so every launch resource (registers, 24-KiB shared memory) matches the 35B profile.
+struct Bf16Gdn9Geometry {
+    static constexpr int kHeads  = 32;
+    static constexpr int kHidden = 4096;
+    static constexpr int kBlockN = 64;
+};
+
 static_assert(Bf16Gdn27Geometry::kHidden % kBf16GdnBlockK == 0);
 static_assert(Bf16Gdn35Geometry::kHidden % kBf16GdnBlockK == 0);
+static_assert(Bf16Gdn9Geometry::kHidden % kBf16GdnBlockK == 0);
 
 __device__ __forceinline__ int bf16_gdn_swizzle(int row, int col) {
     return (col & ~63) + gemm_swz64(row, col & 63);

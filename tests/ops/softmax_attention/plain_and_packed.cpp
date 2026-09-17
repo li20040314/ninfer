@@ -44,7 +44,9 @@ std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
 void packed_attention_oracle(const std::vector<float>& q, const std::vector<float>& k,
                              const std::vector<float>& v, const std::vector<int>& cu_seqlens,
                              std::vector<double>& out) {
-    constexpr double scale = 1.0 / std::sqrt(72.0);
+    // std::sqrt is not a constant expression on this toolchain; the value is
+    // 1/sqrt(72) for the packed 72-head test geometry.
+    const double scale = 0.1178511301977579207;
     out.assign(q.size(), 0.0);
 
     for (std::size_t segment = 0; segment + 1 < cu_seqlens.size(); ++segment) {

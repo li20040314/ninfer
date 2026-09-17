@@ -1,6 +1,7 @@
 #include "corpus.h"
 #include "evaluation.h"
 
+#include "core/platform.h"
 #include "ninfer/engine.h"
 #include "product/logging/logging.h"
 #include "product/logging/pretty_format.h"
@@ -162,8 +163,7 @@ std::string safe_component(std::string_view value) {
 
 std::string timestamp() {
     const std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-    std::tm utc{};
-    gmtime_r(&now, &utc);
+    std::tm utc = ninfer::platform::utc_calendar_time(static_cast<std::int64_t>(now));
     std::ostringstream out;
     out << std::put_time(&utc, "%Y%m%d-%H%M%S");
     return out.str();

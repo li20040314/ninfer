@@ -11,6 +11,8 @@
 #include <utility>
 
 namespace ninfer::ops::detail {
+
+#if NINFER_ENABLE_LARGE_STATIC_SMEM
 namespace {
 
 constexpr int kRows           = 2048;
@@ -122,5 +124,19 @@ void q8_linear_add_medium_splitk_launch(const Tensor& x, const Weight& weight, T
     }
     CUDA_CHECK(cudaGetLastError());
 }
+#else
+// Both routes below stage their K-split tiles above the 48 KiB of static __shared__ this target
+// allows, so the entry points stay callable but report the limitation instead of launching.
+void q8_linear_add_splitk_mma_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t) {
+    throw std::invalid_argument(
+        "Q8 linear_add split-K MMA: unavailable on this architecture (static shared memory limit)");
+}
+
+void q8_linear_add_medium_splitk_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t) {
+    throw std::invalid_argument(
+        "Q8 linear_add medium split-K: unavailable on this architecture "
+        "(static shared memory limit)");
+}
+#endif
 
 } // namespace ninfer::ops::detail

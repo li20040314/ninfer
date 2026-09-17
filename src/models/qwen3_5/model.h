@@ -4,6 +4,7 @@
 #include "artifact/materializer.h"
 #include "models/qwen3_5/config.h"
 #include "models/qwen3_5/frontend/resources.h"
+#include "models/qwen3_5/offload_stream.h"
 #include "models/qwen3_5/weights.h"
 #include "ninfer/ops/weight_input.h"
 
@@ -51,14 +52,23 @@ public:
         return backing_.stats();
     }
 
+    // Null unless weight offload is enabled. Outlives every borrower of the bound views.
+    [[nodiscard]] const WeightStreamScheduler* offload_stream() const noexcept {
+        return offload_stream_.get();
+    }
+
 private:
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*);
     Model(Config config, LoadOptions options, ModelWeights weights, std::vector<BoundWeight> bound,
-          FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing);
+          FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing,
+          std::unique_ptr<WeightStreamScheduler> offload_stream);
 
     // Destroy all borrowers before backing. The caller keeps DeviceContext alive through cleanup.
+    // `offload_stream_` borrows host bytes from `backing_` and is borrowed by `bound_` views, so
+    // it must be destroyed before backing_; declaration order below guarantees that.
     artifact::MaterializedArtifact backing_;
+    std::unique_ptr<WeightStreamScheduler> offload_stream_;
     Config config_;
     LoadOptions options_;
     ModelWeights weights_;

@@ -16,9 +16,14 @@ int main() {
             1,  2,  7,  8,   9,   16,  17,  24,  25,  31,  32,  33,  40,  41,
             48, 49, 96, 128, 129, 256, 257, 384, 385, 512, 513, 640, 641,
         };
-        const int failures =
+        int failures =
             run_profile("LinearSwiGLU Q4_A16",
                         {QType::Q4_G64_FP16, 34816, 5120, 17408, 1401U, ActivationCompute::A16},
+                        kTokenCases, std::array<std::int32_t, 4>{7, 25, 49, 128});
+        // The 9B profile walks the same intervals: every one of them instantiates the new geometry.
+        failures +=
+            run_profile("LinearSwiGLU Q4_A16 9B",
+                        {QType::Q4_G64_FP16, 24576, 4096, 12288, 1401U, ActivationCompute::A16},
                         kTokenCases, std::array<std::int32_t, 4>{7, 25, 49, 128});
         std::cout << (failures == 0 ? "OK" : "FAIL") << " LinearSwiGLU Q4_A16 correctness\n";
         return failures == 0 ? 0 : 1;

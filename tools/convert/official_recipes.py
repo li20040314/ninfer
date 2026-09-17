@@ -54,7 +54,11 @@ def _optional(model, recipe):
                 recipe.share(prefix + "context_" + role, prefix + role)
 
 
-def _dense_groupwise(model, recipe, vocabulary):
+def _dense_groupwise(model, recipe, vocabulary, output_residual_format=Q5):
+    # `output_residual_format` applies only to weights consumed by single-weight linear ops
+    # (mlp/down via linear, attention/gdn output via linear_add). The value/gate halves of the
+    # fused input projections must stay Q5: their multi-parent native form is paired Q4 (q, k)
+    # + Q5 (value, gate) by contract in ops/weight_input.cpp.
     if "num_experts" in model.config:
         raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
     _optional(model, recipe)
@@ -66,7 +70,9 @@ def _dense_groupwise(model, recipe, vocabulary):
         if name.endswith(("/gdn/a_projection", "/gdn/b_projection")):
             recipe.separate(name)
             continue
-        if name.endswith(
+        if name.endswith(("/attention/output", "/gdn/output", "/mlp/down")):
+            format = output_residual_format
+        elif name.endswith(
             (
                 "/attention/query",
                 "/attention/key",
@@ -86,8 +92,17 @@ def qwen3_6_27b(model, recipe, sources):
     _dense_groupwise(model, recipe, Q6)
 
 
+def qwen3_5_9b(model, recipe, sources):
+    # Dense 9B shares the 27B Q4/Q5/Q6 text-only assignment; sm_89 excludes Q8 from
+    # --components text, and the recipe is name-driven so no geometry overrides are needed.
+    _dense_groupwise(model, recipe, Q6)
+
+
 def qwen3_8_27b(model, recipe, sources):
-    _dense_groupwise(model, recipe, Q8)
+    # mlp/down and the mixer output projections drop to Q4 to shrink the streamed payload for
+    # sm_89 weight offload; one extra GEMV shape backs the down projection up. Value/gate stay
+    # Q5 (paired-native input-projection contract).
+    _dense_groupwise(model, recipe, Q8, output_residual_format=Q4)
 
 
 def qwen3_6_35b_a3b(model, recipe, sources):
@@ -175,6 +190,7 @@ def qwen3_8_27b_nvfp4(model, recipe, sources):
 
 
 RECIPES = {
+    "qwen3_5_9b": qwen3_5_9b,
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,

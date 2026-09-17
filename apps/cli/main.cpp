@@ -276,6 +276,10 @@ int main(int argc, char** argv) {
         engine_options.speculative    = cli.speculative;
         engine_options.enable_vision  = cli.enable_vision;
         engine_options.use_cuda_graph = cli.use_cuda_graph;
+        engine_options.weight_offload_ratio = cli.weight_offload_ratio;
+        engine_options.host_embedding       = cli.host_embedding;
+        engine_options.host_output_head     = cli.host_output_head;
+        engine_options.host_linear          = cli.host_linear;
         // One CLI invocation owns exactly one request, so retained cross-request context has no
         // consumer and must not reserve an extra Device StateImage or run terminal capture.
         engine_options.context_cache.enabled                = false;

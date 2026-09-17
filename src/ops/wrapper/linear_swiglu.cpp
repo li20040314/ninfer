@@ -2,9 +2,14 @@
 #include "ninfer/ops/linear_swiglu.h"
 
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/host/linear_host.h"
+#if NINFER_ENABLE_NVFP4
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#endif
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
+#if NINFER_ENABLE_NVFP4
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
+#endif
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_plan.h"
 
@@ -49,9 +54,11 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
         return detail::q4_linear_swiglu_capacity_workspace_bytes(
             gate_up_rows, gate_up_rows / 2, input_rows, input_rows, min_tokens, max_tokens);
     }
+#if NINFER_ENABLE_NVFP4
     if (qtype == QType::NVFP4 && gate_up_rows == 34816 && input_rows == 5120) {
         return detail::nvfp4_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
+#endif
     if (qtype == QType::FP8_E4M3FN_ROW_BF16 && gate_up_rows == 34816 && input_rows == 5120) {
         return detail::fp8_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
@@ -71,15 +78,21 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
         throw std::invalid_argument("linear_swiglu: x/out must be BF16");
     }
-    const std::int32_t t   = x.ne[1];
+    const std::int32_t t = x.ne[1];
+    // Qwen3.6/3.8 27B: intermediate 17408 over hidden 5120. Every weight format registers here.
     const bool large_shape = x.ne[0] == 5120 && out.ne[0] == 17408 && gate_up_weight.n == 34816 &&
                              gate_up_weight.k == 5120 && gate_up_weight.padded_shape[0] == 34816 &&
                              gate_up_weight.padded_shape[1] == 5120;
+    // Qwen3.5 Small 9B: intermediate 12288 over hidden 4096. Only Q4 registers for this profile;
+    // the Q8, NVFP4, and FP8 catalogues are all keyed to the 27B tuple.
+    const bool q4_9b_shape = x.ne[0] == 4096 && out.ne[0] == 12288 && gate_up_weight.n == 24576 &&
+                             gate_up_weight.k == 4096 && gate_up_weight.padded_shape[0] == 24576 &&
+                             gate_up_weight.padded_shape[1] == 4096;
     const bool q8_shape = x.ne[0] == 2048 && out.ne[0] == 6144 && gate_up_weight.n == 12288 &&
                           gate_up_weight.k == 2048 && gate_up_weight.padded_shape[0] == 12288 &&
                           gate_up_weight.padded_shape[1] == 2048;
     if (t <= 0 || x.ne[2] != 1 || x.ne[3] != 1 || out.ne[1] != t || out.ne[2] != 1 ||
-        out.ne[3] != 1 || (!large_shape && !q8_shape)) {
+        out.ne[3] != 1 || (!large_shape && !q4_9b_shape && !q8_shape)) {
         throw std::invalid_argument("linear_swiglu: invalid tensor shape");
     }
     if (!x.is_contiguous() || !out.is_contiguous()) {
@@ -89,13 +102,25 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         throw std::invalid_argument("linear_swiglu: x/out must be non-null and 16-byte aligned");
     }
 
+    // A host-resident row-split weight has no device kernel to launch: the gate/up contraction and
+    // the SiLU product both run on the CPU and only [M,T] crosses back. The row-split condition
+    // keeps the block/row-scale formats (FP8, NVFP4) on their device dispatches -- a host-resident
+    // weight of those formats is a configuration error and `linear_swiglu_host` rejects it
+    // explicitly rather than silently misreading it.
+    if (gate_up_weight.layout == QuantLayout::RowSplit &&
+        detail::weight_is_host_resident(gate_up_weight)) {
+        detail::linear_swiglu_host(x, gate_up_weight, out, stream);
+        return;
+    }
+
     const bool common_row_split =
         gate_up_weight.layout == QuantLayout::RowSplit &&
         gate_up_weight.scale_dtype == DType::FP16 && gate_up_weight.ndim == 2 &&
         gate_up_weight.shape[0] == gate_up_weight.n &&
         gate_up_weight.shape[1] == gate_up_weight.k && gate_up_weight.qdata != nullptr &&
         gate_up_weight.scales != nullptr;
-    const bool q4_weight = large_shape && gate_up_weight.qtype == QType::Q4_G64_FP16 &&
+    const bool q4_weight = (large_shape || q4_9b_shape) &&
+                           gate_up_weight.qtype == QType::Q4_G64_FP16 &&
                            gate_up_weight.group_size == 64 && gate_up_weight.group == 64 &&
                            common_row_split;
     const bool q8_weight =
@@ -115,9 +140,14 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     }
 
     if (nvfp4_weight) {
+#if NINFER_ENABLE_NVFP4
         (void)detail::validate_nvfp4_weight(gate_up_weight, "nvfp4 linear_swiglu");
         detail::nvfp4_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, stream);
         return;
+#else
+        throw std::invalid_argument(
+            "linear_swiglu: NVFP4 weights require a Blackwell (sm_100+/sm_120+) build");
+#endif
     }
 
     if (!aligned_to(gate_up_weight.qdata, 16) ||

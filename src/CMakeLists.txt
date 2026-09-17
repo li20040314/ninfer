@@ -13,11 +13,21 @@ function(ninfer_cuda_archive target)
   target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 endfunction()
 
-# Physical device, tensor, weight, layout and graph primitives.
+# Blackwell-only NVFP4 (w4a4) kernels and the TMA / fp4-value KV-cache companions are compiled
+# only when the target architecture includes sm_100+/sm_120+. Wrap their entries in this guard so
+# a single explicit source list yields both the Blackwell and the Ada/Hopper builds.
+#
+# The variable holds the *condition expression* consumed by `$<${NINFER_NVFP4_GUARD}:source>`,
+# so it must be `$<BOOL:...>`; writing the bare `$<$<BOOL:...>>` nesting leaves the outer
+# expression unterminated and CMake then looks for a source literally named `$<`.
+set(NINFER_NVFP4_GUARD $<BOOL:${NINFER_ENABLE_NVFP4}>)
+
+# Physical device, tensor, weight, layout, graph and host-platform primitives.
 add_library(ninfer_core STATIC
   core/arena.cu
   core/device.cu
   core/dtype.cpp
+  core/platform.cpp
   core/host_worker_pool.cpp
   core/gdn_replay_records.cpp
   core/cyclic_kv_cache.cpp
@@ -57,22 +67,30 @@ target_link_libraries(ninfer_artifact PUBLIC ninfer_core)
 # Warp-specialized SM120 NVFP4 kernels use setmaxnreg to transfer registers from producer
 # warpgroups to consumer warpgroups. Relocatable device code makes ptxas discard that contract, so
 # these self-contained kernels are intentionally compiled in a non-RDC archive and called through
-# host launchers from ninfer_ops.
-add_library(ninfer_nvfp4_non_rdc STATIC
-  ops/linear/nvfp4/nvfp4_w4a4_tma.cu
-  ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu
-  ops/softmax_attention/dense/causal_cache/prompt_nvfp4_non_rdc.cu)
-ninfer_internal_includes(ninfer_nvfp4_non_rdc)
-set_target_properties(ninfer_nvfp4_non_rdc PROPERTIES
-  CUDA_SEPARABLE_COMPILATION OFF
-  CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
-target_compile_options(ninfer_nvfp4_non_rdc PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
-target_link_libraries(ninfer_nvfp4_non_rdc PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
+# host launchers from ninfer_ops. Blackwell-only: absent from sm_89/sm_90 builds.
+if(NINFER_ENABLE_NVFP4)
+  add_library(ninfer_nvfp4_non_rdc STATIC
+    ops/linear/nvfp4/nvfp4_w4a4_tma.cu
+    ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu
+    ops/softmax_attention/dense/causal_cache/prompt_nvfp4_non_rdc.cu)
+  ninfer_internal_includes(ninfer_nvfp4_non_rdc)
+  set_target_properties(ninfer_nvfp4_non_rdc PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+  target_compile_options(ninfer_nvfp4_non_rdc PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+  target_link_libraries(ninfer_nvfp4_non_rdc PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
+endif()
 
 # Shared mathematical Ops. The list is intentionally explicit: adding a
 # source is a build-boundary decision, not an accidental recursive-glob side effect.
 add_library(ninfer_ops STATIC
   ops/weight_input.cpp
+  # Host-side contraction of offloaded weights. The vectorized translation unit is the only source
+  # in the project compiled with AVX2 enabled, so it is confined to its own file and reached only
+  # behind a runtime CPU check.
+  ops/cpu/rowsplit_gemm.cpp
+  ops/cpu/rowsplit_gemm_scalar.cpp
+  ops/cpu/rowsplit_gemm_avx2.cpp
   ops/launcher/add_bias.cu
   ops/launcher/argmax.cu
   ops/launcher/cast.cu
@@ -109,12 +127,12 @@ add_library(ninfer_ops STATIC
   ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
   ops/softmax_attention/dense/causal_cache/small_t.cu
   ops/softmax_attention/dense/causal_cache/small_t_fp8.cu
-  ops/softmax_attention/dense/causal_cache/small_t_nvfp4.cu
-  ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu
+  $<${NINFER_NVFP4_GUARD}:ops/softmax_attention/dense/causal_cache/small_t_nvfp4.cu>
+  $<${NINFER_NVFP4_GUARD}:ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu>
   ops/softmax_attention/dense/causal_cache/prompt.cu
   ops/softmax_attention/dense/causal_cache/prompt_fp8.cu
-  ops/softmax_attention/dense/causal_cache/prompt_nvfp4.cu
-  ops/softmax_attention/dense/causal_cache/prompt_k8v4.cu
+  $<${NINFER_NVFP4_GUARD}:ops/softmax_attention/dense/causal_cache/prompt_nvfp4.cu>
+  $<${NINFER_NVFP4_GUARD}:ops/softmax_attention/dense/causal_cache/prompt_k8v4.cu>
   ops/softmax_attention/dense/packed/packed_softmax_attention.cpp
   ops/softmax_attention/dense/packed/launch.cu
   ops/softmax_attention/dense/context/context_softmax_attention.cpp
@@ -123,8 +141,8 @@ add_library(ninfer_ops STATIC
   ops/softmax_attention/sliding_window/launch.cu
   ops/kv_cache/append/kv_cache_append.cpp
   ops/kv_cache/append/launch.cu
-  ops/kv_cache/append/nvfp4_launch.cu
-  ops/kv_cache/append/k8v4_launch.cu
+  $<${NINFER_NVFP4_GUARD}:ops/kv_cache/append/nvfp4_launch.cu>
+  $<${NINFER_NVFP4_GUARD}:ops/kv_cache/append/k8v4_launch.cu>
   # Gated DeltaNet Linear Attention core.
   ops/linear_attention/gated_delta_net/gated_delta_net.cpp
   ops/linear_attention/gated_delta_net/replay.cpp
@@ -143,10 +161,10 @@ add_library(ninfer_ops STATIC
   ops/attn_input_proj/fp8/fp8_attn_input_a16_gemm.cu
   ops/attn_input_proj/fp8/fp8_attn_input_a8.cu
   ops/attn_input_proj/fp8/fp8_attn_input_plan.cpp
-  ops/attn_input_proj/nvfp4/nvfp4_attn_input_decode.cu
-  ops/attn_input_proj/nvfp4/nvfp4_attn_input_small_t.cu
-  ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu
-  ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.cpp
+  $<${NINFER_NVFP4_GUARD}:ops/attn_input_proj/nvfp4/nvfp4_attn_input_decode.cu>
+  $<${NINFER_NVFP4_GUARD}:ops/attn_input_proj/nvfp4/nvfp4_attn_input_small_t.cu>
+  $<${NINFER_NVFP4_GUARD}:ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu>
+  $<${NINFER_NVFP4_GUARD}:ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.cpp>
   ops/attn_input_proj/q4_q5/q4_q5_attn_input_gemm_mma.cu
   ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
   ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.cpp
@@ -162,14 +180,14 @@ add_library(ninfer_ops STATIC
   ops/gdn_input_proj/fp8/fp8_gdn_input_plan.cpp
   ops/gdn_input_proj/fp8/fp8_gdn_conv_fused.cu
   ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.cpp
-  ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_decode.cu
-  ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_small_t.cu
-  ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_w4a4.cu
-  ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.cpp
-  ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_decode.cu
-  ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_small_t.cu
-  ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_post.cu
-  ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.cpp
+  $<${NINFER_NVFP4_GUARD}:ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_decode.cu>
+  $<${NINFER_NVFP4_GUARD}:ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_small_t.cu>
+  $<${NINFER_NVFP4_GUARD}:ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_w4a4.cu>
+  $<${NINFER_NVFP4_GUARD}:ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.cpp>
+  $<${NINFER_NVFP4_GUARD}:ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_decode.cu>
+  $<${NINFER_NVFP4_GUARD}:ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_small_t.cu>
+  $<${NINFER_NVFP4_GUARD}:ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_post.cu>
+  $<${NINFER_NVFP4_GUARD}:ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.cpp>
   ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_gemm_mma.cu
   ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
   ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_conv_snapshot.cu
@@ -187,6 +205,7 @@ add_library(ninfer_ops STATIC
   ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_plan.cpp
   ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_materialized.cu
   ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.cpp
+  ops/linear/host/linear_host.cu
   ops/linear/bf16/bf16_dispatch.cpp
   ops/linear/bf16/shapes/n14336_k5120.cu
   ops/linear/bf16/shapes/n5120_k6144.cu
@@ -200,14 +219,14 @@ add_library(ninfer_ops STATIC
   ops/linear/fp8/shapes/n5120_k6144.cu
   ops/linear/fp8/shapes/n5120_k17408.cu
   ops/linear/fp8/shapes/n248320_k5120.cu
-  ops/linear/nvfp4/nvfp4_format.cpp
-  ops/linear/nvfp4/nvfp4_w4a4.cu
-  ops/linear/nvfp4/nvfp4_dispatch.cpp
-  ops/linear/nvfp4/shapes/n14336_k5120.cu
-  ops/linear/nvfp4/shapes/n16384_k5120.cu
-  ops/linear/nvfp4/shapes/n34816_k5120.cu
-  ops/linear/nvfp4/shapes/n5120_k6144.cu
-  ops/linear/nvfp4/shapes/n5120_k17408.cu
+  $<${NINFER_NVFP4_GUARD}:ops/linear/nvfp4/nvfp4_format.cpp>
+  $<${NINFER_NVFP4_GUARD}:ops/linear/nvfp4/nvfp4_w4a4.cu>
+  $<${NINFER_NVFP4_GUARD}:ops/linear/nvfp4/nvfp4_dispatch.cpp>
+  $<${NINFER_NVFP4_GUARD}:ops/linear/nvfp4/shapes/n14336_k5120.cu>
+  $<${NINFER_NVFP4_GUARD}:ops/linear/nvfp4/shapes/n16384_k5120.cu>
+  $<${NINFER_NVFP4_GUARD}:ops/linear/nvfp4/shapes/n34816_k5120.cu>
+  $<${NINFER_NVFP4_GUARD}:ops/linear/nvfp4/shapes/n5120_k6144.cu>
+  $<${NINFER_NVFP4_GUARD}:ops/linear/nvfp4/shapes/n5120_k17408.cu>
   ops/linear/q4/q4_rowsplit_gemm_mma.cu
   ops/linear/q4/q4_rowsplit_gemm_simt.cu
   ops/linear/q4/q4_rowsplit_gemv.cu
@@ -215,6 +234,7 @@ add_library(ninfer_ops STATIC
   ops/linear/q4/shapes/n1024_k5120.cu
   ops/linear/q4/shapes/n4096_k5120.cpp
   ops/linear/q4/shapes/n5120_k6144.cu
+  ops/linear/q4/shapes/n5120_k17408.cu
   ops/linear/q4/shapes/n6144_k5120.cu
   ops/linear/q4/shapes/n7168_k5120.cpp
   ops/linear/q4/shapes/n34816_k5120.cpp
@@ -222,6 +242,12 @@ add_library(ninfer_ops STATIC
   ops/linear/q4/shapes/n131072_k2048.cu
   ops/linear/q4/shapes/n3456_k1152.cpp
   ops/linear/q4/shapes/n4304_k1152.cpp
+  ops/linear/q4/shapes/n1024_k4096.cpp
+  ops/linear/q4/shapes/n2048_k4096.cpp
+  ops/linear/q4/shapes/n4096_k4096.cpp
+  ops/linear/q4/shapes/n5120_k4096.cpp
+  ops/linear/q4/shapes/n12288_k4096.cpp
+  ops/linear/q4/shapes/n24576_k4096.cpp
   ops/linear/q5/q5_dispatch.cpp
   ops/linear/q5/shapes/n1024_k5120.cpp
   ops/linear/q5/shapes/n6144_k5120.cu
@@ -230,6 +256,11 @@ add_library(ninfer_ops STATIC
   ops/linear/q5/shapes/n5120_k17408.cu
   ops/linear/q5/shapes/n1152_k1152.cpp
   ops/linear/q5/shapes/n1152_k4304.cpp
+  ops/linear/q5/shapes/n1024_k4096.cpp
+  ops/linear/q5/shapes/n4096_k4096.cpp
+  ops/linear/q5/shapes/n5120_k4096.cpp
+  ops/linear/q5/shapes/n8192_k4096.cpp
+  ops/linear/q5/shapes/n4096_k12288.cpp
   ops/linear/q5/q5_rowsplit_gemm_mma.cu
   ops/linear/q5/q5_rowsplit_gemm_simt.cu
   ops/linear/q5/q5_rowsplit_gemv.cu
@@ -237,10 +268,10 @@ add_library(ninfer_ops STATIC
   ops/linear_add/bf16/bf16_linear_add_gemm_mma.cu
   ops/linear_add/bf16/bf16_linear_add_small_t.cu
   ops/linear_add/bf16/bf16_linear_add_plan.cpp
-  ops/linear_add/nvfp4/nvfp4_linear_add_decode.cu
-  ops/linear_add/nvfp4/nvfp4_linear_add_small_t.cu
-  ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu
-  ops/linear_add/nvfp4/nvfp4_linear_add_plan.cpp
+  $<${NINFER_NVFP4_GUARD}:ops/linear_add/nvfp4/nvfp4_linear_add_decode.cu>
+  $<${NINFER_NVFP4_GUARD}:ops/linear_add/nvfp4/nvfp4_linear_add_small_t.cu>
+  $<${NINFER_NVFP4_GUARD}:ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu>
+  $<${NINFER_NVFP4_GUARD}:ops/linear_add/nvfp4/nvfp4_linear_add_plan.cpp>
   ops/linear_add/fp8/fp8_linear_add_decode.cu
   ops/linear_add/fp8/fp8_linear_add_small_t.cu
   ops/linear_add/fp8/fp8_linear_add_a8.cu
@@ -259,10 +290,10 @@ add_library(ninfer_ops STATIC
   ops/linear_swiglu/q4/q4_linear_swiglu_gemm_mma.cu
   ops/linear_swiglu/q4/q4_linear_swiglu_gemv.cu
   ops/linear_swiglu/q4/q4_linear_swiglu_plan.cpp
-  ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_decode.cu
-  ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_small_t.cu
-  ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu
-  ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp
+  $<${NINFER_NVFP4_GUARD}:ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_decode.cu>
+  $<${NINFER_NVFP4_GUARD}:ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_small_t.cu>
+  $<${NINFER_NVFP4_GUARD}:ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu>
+  $<${NINFER_NVFP4_GUARD}:ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp>
   ops/linear_swiglu/fp8/fp8_linear_swiglu_decode.cu
   ops/linear_swiglu/fp8/fp8_linear_swiglu_small_t.cu
   ops/linear_swiglu/fp8/fp8_linear_swiglu_a8.cu
@@ -276,6 +307,7 @@ add_library(ninfer_ops STATIC
   ops/linear/q6/shapes/n248320_k5120.cpp
   ops/linear/q6/shapes/n248320_k2048.cpp
   ops/linear/q6/shapes/n1152_k1536.cpp
+  ops/linear/q6/shapes/n248320_k4096.cpp
   ops/linear/q6/q6_rowsplit_gemm_mma.cu
   ops/linear/q6/q6_rowsplit_gemm_simt.cu
   ops/linear/q8/q8_rowsplit_gemm_mma.cu
@@ -354,15 +386,38 @@ add_library(ninfer_ops STATIC
   ops/wrapper/sparse_moe.cpp
   ops/wrapper/target_logprobs.cpp
   ops/wrapper/vision_pos_embed.cpp)
+
+# The CPU contraction's vectorized translation unit is the single exception to the project-wide host
+# ISA: without AVX2 the intrinsics do not exist at all. Confining the flag to one source file rather
+# than to the target keeps every other object runnable on a host without AVX2, which is why
+# rowsplit_gemm.cpp gates the call behind a runtime CPU check instead of assuming the build's ISA.
+if(MSVC)
+  set_source_files_properties(ops/cpu/rowsplit_gemm_avx2.cpp
+    PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+else()
+  set_source_files_properties(ops/cpu/rowsplit_gemm_avx2.cpp
+    PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+endif()
+
 ninfer_internal_includes(ninfer_ops)
-ninfer_cuda_archive(ninfer_ops)
-target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_non_rdc)
+ninfer_cuda_archive(ninfer_ops)# The NVFP4 capability macro is defined project-wide in the top-level CMakeLists; only the link
+# dependency on the non-RDC kernel archive is target-specific.
+if(NINFER_ENABLE_NVFP4)
+  target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_non_rdc)
+else()
+  target_link_libraries(ninfer_ops PUBLIC ninfer_core)
+endif()
 
 # Product-independent text and media mechanisms.
 add_library(ninfer_text STATIC
   text/unicode.cpp
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
 ninfer_internal_includes(ninfer_text)
+# utf8proc is compiled into this archive rather than imported from a DLL, so its header must not
+# declare the API as dllimport. Without UTF8PROC_STATIC the MSVC build rejects every definition with
+#   error C2491: 'utf8proc_...': definition of dllimport function not allowed
+# Linux never sees this: there the header expands to a visibility attribute instead.
+target_compile_definitions(ninfer_text PRIVATE UTF8PROC_STATIC)
 
 # Immutable model data and cold loading, independently buildable from Program and Engine.
 add_library(ninfer_model_loading STATIC
@@ -370,6 +425,7 @@ add_library(ninfer_model_loading STATIC
   models/qwen3_5/config.cpp
   models/qwen3_5/model.cpp
   models/qwen3_5/load.cpp
+  models/qwen3_5/offload_stream.cpp
   models/qwen3_5/load/text.cpp
   models/qwen3_5/load/vision.cpp
   models/qwen3_5/load/mtp.cpp
@@ -440,6 +496,13 @@ if(NINFER_BUILD_MEDIA_ACQUIRE)
     product/media_acquire/acquire.cpp)
   ninfer_internal_includes(ninfer_media_acquire)
   target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+  if(WIN32)
+    # acquire.cpp resolves and verifies host addresses through Winsock, whose entry points live in
+    # this library rather than in the C runtime: `getaddrinfo`, `freeaddrinfo`, `inet_ntop` and
+    # `ntohl` are unresolved until it is named. The files that reach Winsock through cpp-httplib
+    # instead do not need this, because httplib.h carries its own `ws2_32.lib` link pragma.
+    target_link_libraries(ninfer_media_acquire PRIVATE ws2_32)
+  endif()
 endif()
 
 if(NINFER_BUILD_PROMPT_INPUT)

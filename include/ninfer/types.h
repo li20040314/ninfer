@@ -166,6 +166,28 @@ struct EngineOptions {
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
+    // Fraction of text-layer weight bytes that streams from host memory each token.
+    // Zero disables offload. Nonzero forces use_cuda_graph off (P0).
+    float weight_offload_ratio             = 0.0F;
+    // Keep the text embedding table in page-locked host memory instead of device memory. The row
+    // gather reads it directly, so a handful of rows per step costs ~8 us while the table stops
+    // occupying device memory. Requires weight_offload_ratio: the freed footprint goes to the
+    // streaming layers, cutting the per-step transfer by that much.
+    bool host_embedding                    = false;
+    // Contract the output head on the CPU from a host-resident copy instead of keeping it resident
+    // on the device. The head differs from the embedding table in every way that matters: it is
+    // read in full on every step, so a zero-copy row gather cannot serve it, and a device upload
+    // would cost the whole footprint in PCIe traffic each token. A CPU contraction reads the same
+    // bytes at DRAM speed while the freed device footprint goes to the streaming layers. Requires
+    // weight_offload_ratio; the head must be a grouped RowSplit format.
+    bool host_output_head                  = false;
+    // Contract the layers `weight_offload_ratio` would otherwise stream on the CPU instead of
+    // copying their weights across PCIe. The ratio keeps its meaning -- it still selects how many
+    // leading layers stay device resident -- so the two compose: the resident prefix runs on the
+    // GPU, everything after it is contracted from host memory at DRAM speed. Requires
+    // weight_offload_ratio; the split must leave a nonzero resident prefix or the whole model
+    // moves to the CPU.
+    bool host_linear                       = false;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;

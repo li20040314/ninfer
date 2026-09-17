@@ -30,6 +30,7 @@ struct Geometry {
 constexpr Geometry kQwen27{"qwen3_6_27b", 5120, 48, false};
 constexpr Geometry kQwen38Parent{"qwen3_8_27b_parent", 5120, 48, true};
 constexpr Geometry kQwen35{"qwen3_6_35b_a3b", 2048, 32, true};
+constexpr Geometry kQwen359{"qwen3_5_9b", 4096, 32, true};
 
 constexpr ReductionCriterion kGdnProjectionFp32{/*relative_l2=*/1.4e-6,
                                                 /*gross_absolute=*/5.0e-7,
@@ -496,6 +497,7 @@ int main() {
     int failures = 0;
     failures += verify_workspace_capacity_contract(kQwen27, {1, 8, 1024, 2048, 4096, 4097});
     failures += verify_workspace_capacity_contract(kQwen35, {1, 127, 1024, 2048, 4096, 4097});
+    failures += verify_workspace_capacity_contract(kQwen359, {1, 127, 1024, 2048, 4096, 4097});
 
     // Every registered 27B projection route, including predicated and full token tiles.
     for (const std::int32_t tokens : {1, 8, 9, 1024, 1025, 2049, 4097}) {
@@ -509,6 +511,11 @@ int main() {
     for (const std::int32_t tokens : {1, 127, 128, 1024, 1025, 2049, 4097}) {
         failures += run_projection_case(kQwen35, tokens,
                                         0x2000u + static_cast<std::uint32_t>(tokens), execution);
+    }
+    // Every registered 9B projection route (MMA only, same CTA shape as 35B with K=4096).
+    for (const std::int32_t tokens : {1, 127, 128, 1024, 1025, 2049, 4097}) {
+        failures += run_projection_case(kQwen359, tokens,
+                                        0x8800u + static_cast<std::uint32_t>(tokens), execution);
     }
 
     // Direct complete norm/control oracles across variable widths and the existing 35B profile.
@@ -536,6 +543,13 @@ int main() {
     for (int tokens : {2, 8, 15, 127, 128, 1024, 1025, 2048, 2049, 4097})
         failures += run_norm_projection_case(kQwen35, tokens, 0x7800u + tokens, norm_execution,
                                              tokens == 15);
+    // 9B always composes RMSNorm with the control projection (no fused kernel); cover the small-T
+    // span plus the prefill reduction boundaries, and one capture/replay case on the split-16
+    // cooperative control route.
+    for (int tokens : {1, 6, 16, 17, 64, 129, 1024, 2048, 4097})
+        failures +=
+            run_norm_projection_case(kQwen359, tokens, 0x9800u + tokens, norm_execution);
+    failures += run_norm_projection_case(kQwen359, 8, 0xA808u, norm_execution, true);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_gating_proj correctness\n";
     return failures == 0 ? 0 : 1;

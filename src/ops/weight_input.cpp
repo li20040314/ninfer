@@ -112,21 +112,31 @@ SingleProjectionWeight single(std::span<const WeightInput> inputs) {
     return {native_weight(view, divisor), policy};
 }
 
+bool shape_is(const std::vector<std::uint64_t>& shape, std::uint64_t rows,
+              std::uint64_t columns) {
+    return shape.size() == 2 && shape[0] == rows && shape[1] == columns;
+}
+
 ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool attention) {
     const auto& q      = matrix(inputs[0]);
     const auto& k      = matrix(inputs[1]);
     const auto& third  = matrix(inputs[2]);
     const auto& fourth = matrix(inputs[3]);
+    // Dense profiles: query/gate carry the attention width and key/value the KV width. Qwen3.6/3.8
+    // 27B (hidden 5120) is the tuned target; Qwen3.5 Small 9B (hidden 4096) is the Ada profile.
     const bool dense =
-        attention ? q == std::vector<std::uint64_t>{6144, 5120} &&
-                        k == std::vector<std::uint64_t>{1024, 5120} && third == q && fourth == k
-                  : q == std::vector<std::uint64_t>{2048, 5120} && k == q &&
-                        third == std::vector<std::uint64_t>{6144, 5120} && fourth == third;
+        attention ? (shape_is(q, 6144, 5120) && shape_is(k, 1024, 5120) && third == q &&
+                     fourth == k) ||
+                        (shape_is(q, 4096, 4096) && shape_is(k, 1024, 4096) && third == q &&
+                         fourth == k)
+                  : (shape_is(q, 2048, 5120) && k == q && shape_is(third, 6144, 5120) &&
+                     fourth == third) ||
+                        (shape_is(q, 2048, 4096) && k == q && shape_is(third, 4096, 4096) &&
+                         fourth == third);
     const bool moe =
-        attention ? q == std::vector<std::uint64_t>{4096, 2048} &&
-                        k == std::vector<std::uint64_t>{512, 2048} && third == q && fourth == k
-                  : q == std::vector<std::uint64_t>{2048, 2048} && k == q &&
-                        third == std::vector<std::uint64_t>{4096, 2048} && fourth == third;
+        attention ? shape_is(q, 4096, 2048) && shape_is(k, 512, 2048) && third == q && fourth == k
+                  : shape_is(q, 2048, 2048) && k == q && shape_is(third, 4096, 2048) &&
+                        fourth == third;
     require(dense || moe, "input projection: unsupported logical projection geometry");
     const auto joined = concatenate_rows(inputs);
     if (contiguous(joined)) {
@@ -188,8 +198,9 @@ ProjectionWeights prepare_gdn_input_proj_weights(const WeightInput& query, const
 
 ProjectionWeights prepare_gdn_gating_proj_weights(const WeightInput& a, const WeightInput& b) {
     const auto& shape = matrix(a);
-    require(shape == matrix(b) && (shape == std::vector<std::uint64_t>{48, 5120} ||
-                                   shape == std::vector<std::uint64_t>{32, 2048}),
+    // One A/B geometry per admitted profile: 27B (48 heads), 35B-A3B and 9B (32 heads each).
+    require(shape == matrix(b) && (shape_is(shape, 48, 5120) || shape_is(shape, 32, 2048) ||
+                                   shape_is(shape, 32, 4096)),
             "GDN control: unsupported A/B geometry");
     const std::array inputs{a, b};
     if (contiguous(concatenate_rows(inputs))) {
@@ -197,7 +208,10 @@ ProjectionWeights prepare_gdn_gating_proj_weights(const WeightInput& a, const We
         require(result.weight.qtype == QType::BF16, "GDN control requires BF16 weights");
         return result;
     }
-    require(shape[0] == 48, "GDN control: this geometry requires a combined parent");
+    // Paired storage is admissible for every registered geometry; the wrapper's
+    // paired entry validates the concrete rows/hidden combination.
+    require(shape[0] == 48 || shape[0] == 32,
+            "GDN control: this geometry requires a combined parent");
     const auto first  = prepare_linear_weight(a);
     const auto second = prepare_linear_weight(b);
     require(first.weight.qtype == QType::BF16 && second.weight.qtype == QType::BF16,

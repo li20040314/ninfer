@@ -64,6 +64,7 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
 void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
                                               const PagedKVLayerView& cache, Tensor& out,
                                               cudaStream_t stream) {
+#if NINFER_ENABLE_NVFP4
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         causal_attention_prompt_k8v4_attention_launch(q, positions, scale, cache, out, stream);
         return;
@@ -72,6 +73,7 @@ void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& pos
         causal_attention_prompt_nvfp4_attention_launch(q, positions, scale, cache, out, stream);
         return;
     }
+#endif
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         causal_attention_prompt_fp8_attention_launch(q, positions, scale, cache, out, stream);
         return;
@@ -79,6 +81,11 @@ void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& pos
     const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
         causal_attention_prompt_attention_launch_for<CausalD256H24Kv4>(q, positions, scale, cache,
+                                                                       metadata, out, stream);
+        return;
+    }
+    if (cache.num_kv_heads == CausalD256H16Kv4::KVHeads) {
+        causal_attention_prompt_attention_launch_for<CausalD256H16Kv4>(q, positions, scale, cache,
                                                                        metadata, out, stream);
         return;
     }
@@ -90,6 +97,7 @@ void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tens
                                     const Tensor& positions, const Tensor& valid_columns,
                                     const Tensor& table_rows, float scale,
                                     PagedKVBatchLayerView cache, Tensor& out, cudaStream_t stream) {
+#if NINFER_ENABLE_NVFP4
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         causal_attention_prompt_k8v4_launch(q, k, v, positions, valid_columns, table_rows, scale,
                                             cache, out, stream);
@@ -100,6 +108,7 @@ void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tens
                                              cache, out, stream);
         return;
     }
+#endif
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         causal_attention_prompt_fp8_launch(q, k, v, positions, valid_columns, table_rows, scale,
                                            cache, out, stream);
@@ -116,6 +125,11 @@ void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tens
         };
         if (q.ne[1] == CausalD256H24Kv4::QHeads) {
             causal_attention_prompt_attention_launch_for<CausalD256H24Kv4>(
+                q, positions, scale, cache, metadata, out, stream);
+            return;
+        }
+        if (cache.num_kv_heads == CausalD256H16Kv4::KVHeads) {
+            causal_attention_prompt_attention_launch_for<CausalD256H16Kv4>(
                 q, positions, scale, cache, metadata, out, stream);
             return;
         }

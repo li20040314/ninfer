@@ -198,13 +198,21 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
     if (static_cast<std::uint32_t>(tokens) > capacity) {
         throw std::invalid_argument("kv_cache_append: T exceeds cache capacity");
     }
-    if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
-        detail::kv_cache_append_k8v4_launch(k, v, positions, cache, stream);
-    } else if (cache.storage == KvCacheStorage::Nvfp4Group16) {
-        detail::kv_cache_append_nvfp4_launch(k, v, positions, cache, stream);
-    } else {
-        detail::kv_cache_append_launch(k, v, positions, cache, stream);
+    if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value ||
+        cache.storage == KvCacheStorage::Nvfp4Group16) {
+#if NINFER_ENABLE_NVFP4
+        if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+            detail::kv_cache_append_k8v4_launch(k, v, positions, cache, stream);
+        } else {
+            detail::kv_cache_append_nvfp4_launch(k, v, positions, cache, stream);
+        }
+        return;
+#else
+        throw std::invalid_argument(
+            "kv_cache_append: FP4 KV-cache storage requires a Blackwell (sm_100+/sm_120+) build");
+#endif
     }
+    detail::kv_cache_append_launch(k, v, positions, cache, stream);
 }
 
 void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& positions,

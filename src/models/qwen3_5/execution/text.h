@@ -22,6 +22,10 @@
 #include <span>
 #include <vector>
 
+namespace ninfer::models::qwen3_5 {
+class WeightStreamScheduler;
+} // namespace ninfer::models::qwen3_5
+
 namespace ninfer::models::qwen3_5::execution {
 
 using Phase = qwen3_5::TextPhase;
@@ -210,6 +214,7 @@ private:
                  const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end);
     DeviceContext& ctx_;
     const Parameters& parameters_;
+    const WeightStreamScheduler* streamed_ = nullptr;
     const TextConfig& config_;
     WorkspaceArena& work_;
     qwen3_5::PagedKVCacheView kv_;

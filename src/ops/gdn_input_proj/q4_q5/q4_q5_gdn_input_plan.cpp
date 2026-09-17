@@ -1,6 +1,7 @@
 #include "core/weight.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
 
+#include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_geometry.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
 
 #include <array>
@@ -39,8 +40,14 @@ constexpr bool catalog_is_closed() noexcept {
 static_assert(catalog_is_closed(), "GDN input routes must be exact and closed");
 
 bool supported_shape(const Q4Q5GdnInputProblem& problem) noexcept {
-    return problem.input_rows == 5120 && problem.qk_rows == 4096 && problem.value_z_rows == 12288 &&
-           problem.qkv_rows == 10240 && problem.z_rows == 6144 && problem.padded_k == 5120;
+    for (const Q4Q5GdnInputGeometry& geometry : kQ4Q5GdnInputGeometries) {
+        if (q4_q5_gdn_input_geometry_matches(geometry, problem.input_rows, problem.qk_rows,
+                                             problem.value_z_rows, problem.qkv_rows, problem.z_rows,
+                                             problem.padded_k)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace

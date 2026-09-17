@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "ops/linear_swiglu/q4/q4_linear_swiglu_geometry.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
 
 #include "ops/common/math.cuh"
@@ -10,46 +11,64 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <array>
 #include <cstdint>
 #include <stdexcept>
-#include <array>
+#include <type_traits>
 #include <utility>
 
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr int kN                 = 34816;
-constexpr int kK                 = 5120;
-constexpr int kIntermediate      = kN / 2;
-constexpr int kGroupK            = 64;
-constexpr int kGroups            = kK / kGroupK;
-constexpr int kBytesPerGroup     = 32;
-constexpr int kVecBytes          = 16;
-constexpr int kGroupsPerWarpTile = 16;
-constexpr int kVecsPerWarpTile   = kGroupsPerWarpTile * kBytesPerGroup / kVecBytes;
-constexpr int kWarpsPerBlock     = 4;
-constexpr int kBlockThreads      = kWarpsPerBlock * 32;
-constexpr int kPairsPerBlock     = kWarpsPerBlock;
-constexpr int kXVecs             = kK / 8; // x as uint4 (8 bf16 each)
-constexpr int kTiles             = kGroups / kGroupsPerWarpTile;
-static_assert(kIntermediate % kPairsPerBlock == 0);
-static_assert(kBytesPerGroup == 2 * kVecBytes);
-static_assert(kGroups % kGroupsPerWarpTile == 0);
-static_assert(kVecsPerWarpTile == 32);
-
-struct Q4SwiGluSmallTGeometry {
-    static constexpr int kInputRows    = kK;
-    static constexpr int kGroupsPerRow = kK / kGroupK;
+// The shape-specialised kernels bake the fused gate/up width and the contraction width into
+// template arguments, so each registered geometry needs its own instantiation. Taking the numbers
+// from the geometry table keeps that table the single source of truth: a profile cannot drift from
+// the tuple the plan admits.
+//
+// The parameters are plain integers even though the geometry is a struct. nvcc's host stub
+// generation cannot emit the stub for a `__global__` whose template arguments carry a class-type
+// non-type template parameter, so the geometry stops at the profile boundary.
+template <int GateUpRows_, int InputRows_>
+struct Q4SwiGluProfile {
+    static constexpr int kN            = GateUpRows_;
+    static constexpr int kK            = InputRows_;
+    static constexpr int kIntermediate = kN / 2;
+    static constexpr int kGroupK       = 64;
+    static constexpr int kGroups       = kK / kGroupK;
+    static constexpr int kBytesPerGroup     = 32;
+    static constexpr int kVecBytes          = 16;
+    static constexpr int kGroupsPerWarpTile = 16;
+    static constexpr int kVecsPerWarpTile   = kGroupsPerWarpTile * kBytesPerGroup / kVecBytes;
+    static constexpr int kWarpsPerBlock     = 4;
+    static constexpr int kBlockThreads      = kWarpsPerBlock * 32;
+    static constexpr int kPairsPerBlock     = kWarpsPerBlock;
+    static constexpr int kXVecs             = kK / 8; // x as uint4 (8 bf16 each)
+    static constexpr int kTiles             = kGroups / kGroupsPerWarpTile;
+    static_assert(kIntermediate % kPairsPerBlock == 0);
+    static_assert(kBytesPerGroup == 2 * kVecBytes);
+    static_assert(kGroups % kGroupsPerWarpTile == 0);
+    static_assert(kVecsPerWarpTile == 32);
 };
 
+using SwiGlu27BProfile = Q4SwiGluProfile<kQ4SwiGlu27B.gate_up_rows, kQ4SwiGlu27B.k>;
+using SwiGlu9BProfile  = Q4SwiGluProfile<kQ4SwiGlu9B.gate_up_rows, kQ4SwiGlu9B.k>;
+
+template <class Profile>
+struct Q4SwiGluSmallTGeometry {
+    static constexpr int kInputRows    = Profile::kK;
+    static constexpr int kGroupsPerRow = Profile::kK / Profile::kGroupK;
+};
+
+template <class Profile>
 struct Q4SwiGluSmallTRows {
     static constexpr int kOutputRowsPerCta = 8;
 
     __device__ __forceinline__ int weight_row(int output_row0, int local_row) const {
-        return output_row0 + (local_row & 7) + (local_row >= 8 ? kIntermediate : 0);
+        return output_row0 + (local_row & 7) + (local_row >= 8 ? Profile::kIntermediate : 0);
     }
 };
 
+template <class Profile>
 struct Q4SwiGluSmallTEpilogue {
     __nv_bfloat16* out;
     int columns;
@@ -57,49 +76,62 @@ struct Q4SwiGluSmallTEpilogue {
     template <int ActiveCols>
     __device__ __forceinline__ void store(int row, int col0, float4 projected) const {
         if (col0 < columns) {
-            out[static_cast<std::int64_t>(col0) * kIntermediate + row] =
+            out[static_cast<std::int64_t>(col0) * Profile::kIntermediate + row] =
                 __float2bfloat16_rn(silu(projected.x) * projected.z);
         }
         if (col0 + 1 < columns) {
-            out[static_cast<std::int64_t>(col0 + 1) * kIntermediate + row] =
+            out[static_cast<std::int64_t>(col0 + 1) * Profile::kIntermediate + row] =
                 __float2bfloat16_rn(silu(projected.y) * projected.w);
         }
     }
 };
 
-using SmallTLauncher = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
-
-template <int ActiveCols>
+template <class Profile, int ActiveCols>
 void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     constexpr int TileCols =
         ActiveCols <= 8 ? 8 : (ActiveCols <= 16 ? 16 : (ActiveCols <= 24 ? 24 : 32));
-    constexpr int kBlocks = kIntermediate / Q4SwiGluSmallTRows::kOutputRowsPerCta;
-    const Q4SwiGluSmallTEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data), x.ne[1]};
-    q4_ksplit_mma_kernel<Q4SwiGluSmallTGeometry, TileCols, ActiveCols, Q4SwiGluSmallTEpilogue,
-                          Q4SwiGluSmallTRows, true>
+    constexpr int kBlocks = Profile::kIntermediate / Q4SwiGluSmallTRows<Profile>::kOutputRowsPerCta;
+    const Q4SwiGluSmallTEpilogue<Profile> epilogue{static_cast<__nv_bfloat16*>(out.data), x.ne[1]};
+    q4_ksplit_mma_kernel<Q4SwiGluSmallTGeometry<Profile>, TileCols, ActiveCols,
+                         Q4SwiGluSmallTEpilogue<Profile>, Q4SwiGluSmallTRows<Profile>, true>
         <<<kBlocks, Q4KSplitMmaSchedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
-            epilogue, Q4SwiGluSmallTRows{}, x.ne[1]);
+            epilogue, Q4SwiGluSmallTRows<Profile>{}, x.ne[1]);
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <std::size_t... Offsets>
-constexpr auto make_small_t_launchers(std::index_sequence<Offsets...>) {
-    return std::array<SmallTLauncher, sizeof...(Offsets)>{
-        &launch_small_t_active<8 * (1 + static_cast<int>(Offsets))>...};
+// T=2..32 in four 8-column tiles. A switch keeps this a plain function: a constexpr table of
+// pointers to the instantiations is a variable template, which the device host stub does not carry.
+template <class Profile>
+void launch_small_t_route(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    switch ((x.ne[1] - 1) / 8) {
+    case 0:
+        launch_small_t_active<Profile, 8>(x, w, out, stream);
+        return;
+    case 1:
+        launch_small_t_active<Profile, 16>(x, w, out, stream);
+        return;
+    case 2:
+        launch_small_t_active<Profile, 24>(x, w, out, stream);
+        return;
+    default:
+        launch_small_t_active<Profile, 32>(x, w, out, stream);
+        return;
+    }
 }
 
-constexpr auto kSmallTLaunchers = make_small_t_launchers(std::make_index_sequence<4>{});
-
-__device__ __forceinline__ void q4_issue_pair_tile(uint4 (*__restrict__ s_code)[kVecsPerWarpTile],
-                                                   uint4 (*__restrict__ s_scale)[2],
-                                                   const std::uint8_t* __restrict__ gate_code_row,
-                                                   const std::uint8_t* __restrict__ gate_scale_row,
-                                                   const std::uint8_t* __restrict__ up_code_row,
-                                                   const std::uint8_t* __restrict__ up_scale_row,
-                                                   int tile, int lane) {
-    const int g0 = tile * kGroupsPerWarpTile;
+template <class Profile>
+__device__ __forceinline__ void
+q4_issue_pair_tile(uint4 (*__restrict__ s_code)[Profile::kVecsPerWarpTile],
+                   uint4 (*__restrict__ s_scale)[2],
+                   const std::uint8_t* __restrict__ gate_code_row,
+                   const std::uint8_t* __restrict__ gate_scale_row,
+                   const std::uint8_t* __restrict__ up_code_row,
+                   const std::uint8_t* __restrict__ up_scale_row, int tile, int lane) {
+    constexpr int kGroupsPerWarpTile = Profile::kGroupsPerWarpTile;
+    constexpr int kBytesPerGroup     = Profile::kBytesPerGroup;
+    const int g0                     = tile * kGroupsPerWarpTile;
     pipe_copy<16>(&s_code[0][lane],
                   reinterpret_cast<const uint4*>(gate_code_row + g0 * kBytesPerGroup) + lane);
     pipe_copy<16>(&s_code[1][lane],
@@ -113,13 +145,23 @@ __device__ __forceinline__ void q4_issue_pair_tile(uint4 (*__restrict__ s_code)[
     pipe_commit();
 }
 
+template <class Profile>
 __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restrict__ x,
                                                   const std::uint8_t* __restrict__ codes,
                                                   const std::uint8_t* __restrict__ scales,
                                                   __nv_bfloat16* __restrict__ out) {
-    constexpr int kStages   = 3;
-    constexpr int kPrefetch = kStages - 1;
-    __shared__ __align__(16) __nv_bfloat16 x_sh[kK];
+    constexpr int kStages                 = 3;
+    constexpr int kPrefetch               = kStages - 1;
+    constexpr int kGroupsPerWarpTile      = Profile::kGroupsPerWarpTile;
+    constexpr int kBytesPerGroup          = Profile::kBytesPerGroup;
+    constexpr int kVecsPerWarpTile        = Profile::kVecsPerWarpTile;
+    constexpr int kWarpsPerBlock          = Profile::kWarpsPerBlock;
+    constexpr int kPairsPerBlock          = Profile::kPairsPerBlock;
+    constexpr int kXVecs                  = Profile::kXVecs;
+    constexpr int kTiles                  = Profile::kTiles;
+    constexpr int kGroups                 = Profile::kGroups;
+    constexpr int kIntermediate           = Profile::kIntermediate;
+    __shared__ __align__(16) __nv_bfloat16 x_sh[Profile::kK];
     __shared__ uint4 code_tile[kWarpsPerBlock][kStages][2][kVecsPerWarpTile];
     __shared__ uint4 scale_tile[kWarpsPerBlock][kStages][2][2];
 
@@ -148,8 +190,8 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
 #pragma unroll
     for (int p = 0; p < kPrefetch; ++p) {
         if (p < kTiles) {
-            q4_issue_pair_tile(code_tile[warp][p], scale_tile[warp][p], gate_code_row,
-                               gate_scale_row, up_code_row, up_scale_row, p, lane);
+            q4_issue_pair_tile<Profile>(code_tile[warp][p], scale_tile[warp][p], gate_code_row,
+                                        gate_scale_row, up_code_row, up_scale_row, p, lane);
         } else {
             pipe_commit();
         }
@@ -160,8 +202,8 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
         const int fetch = tile + kPrefetch;
         if (fetch < kTiles) {
             const int buf = fetch % kStages;
-            q4_issue_pair_tile(code_tile[warp][buf], scale_tile[warp][buf], gate_code_row,
-                               gate_scale_row, up_code_row, up_scale_row, fetch, lane);
+            q4_issue_pair_tile<Profile>(code_tile[warp][buf], scale_tile[warp][buf], gate_code_row,
+                                        gate_scale_row, up_code_row, up_scale_row, fetch, lane);
         } else {
             pipe_commit();
         }
@@ -187,7 +229,7 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
             const int up_packed = static_cast<int>(up_codes[tile_group * kBytesPerGroup + lane]);
             const int up_q0     = sign_extend<4>(up_packed & 0x0f);
             const int up_q1     = sign_extend<4>(up_packed >> 4);
-            const int k0        = (tile * kGroupsPerWarpTile + tile_group) * kGroupK + lane * 2;
+            const int k0        = (tile * kGroupsPerWarpTile + tile_group) * Profile::kGroupK + lane * 2;
             const float2 xv     = __bfloat1622float2(x2[k0 >> 1]);
             gate_acc            = fmaf(static_cast<float>(gate_q0) * gate_scale, xv.x, gate_acc);
             gate_acc            = fmaf(static_cast<float>(gate_q1) * gate_scale, xv.y, gate_acc);
@@ -202,18 +244,37 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
     if (lane == 0) { out[out_row] = __float2bfloat16(silu(gate_acc) * up_acc); }
 }
 
+// True when the weight names this registered geometry exactly, padding included.
+template <class Profile>
+bool matches_profile(const Weight& w) {
+    return w.n == Profile::kN && w.k == Profile::kK && w.padded_shape[0] == Profile::kN &&
+           w.padded_shape[1] == Profile::kK;
+}
+
+template <class Profile>
+void launch_gemv_pair(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    const int grid = Profile::kIntermediate / Profile::kPairsPerBlock;
+    q4_linear_swiglu_gemv_pair_kernel<Profile><<<grid, Profile::kBlockThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace
 
 void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor& out,
                                        cudaStream_t stream) {
-    if (w.n != kN || w.k != kK || w.padded_shape[1] != kK) {
-        throw std::invalid_argument("q4 linear_swiglu GEMV requires weight [34816,5120]");
+    if (matches_profile<SwiGlu27BProfile>(w)) {
+        launch_gemv_pair<SwiGlu27BProfile>(x, w, out, stream);
+        return;
     }
-    const int grid = kIntermediate / kPairsPerBlock;
-    q4_linear_swiglu_gemv_pair_kernel<<<grid, kBlockThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data));
-    CUDA_CHECK(cudaGetLastError());
+    if (matches_profile<SwiGlu9BProfile>(w)) {
+        launch_gemv_pair<SwiGlu9BProfile>(x, w, out, stream);
+        return;
+    }
+    throw std::invalid_argument(
+        "q4 linear_swiglu GEMV: the weight names no registered geometry "
+        "([34816,5120] or [24576,4096])");
 }
 
 void q4_linear_swiglu_small_t_tiled_launch(const Tensor& x, const Weight& w, Tensor& out,
@@ -221,7 +282,17 @@ void q4_linear_swiglu_small_t_tiled_launch(const Tensor& x, const Weight& w, Ten
     if (x.ne[1] < 2 || x.ne[1] > 32) {
         throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=2..32");
     }
-    kSmallTLaunchers[static_cast<std::size_t>((x.ne[1] - 1) / 8)](x, w, out, stream);
+    if (matches_profile<SwiGlu27BProfile>(w)) {
+        launch_small_t_route<SwiGlu27BProfile>(x, w, out, stream);
+        return;
+    }
+    if (matches_profile<SwiGlu9BProfile>(w)) {
+        launch_small_t_route<SwiGlu9BProfile>(x, w, out, stream);
+        return;
+    }
+    throw std::invalid_argument(
+        "Q4 LinearSwiGLU small-T: the weight names no registered geometry "
+        "([34816,5120] or [24576,4096])");
 }
 
 } // namespace ninfer::ops::detail

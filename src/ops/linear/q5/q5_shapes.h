@@ -12,4 +12,11 @@ namespace ninfer::ops::detail {
 [[nodiscard]] Q5Launch select_q5_n1152_k1152(std::int32_t tokens);
 [[nodiscard]] Q5Launch select_q5_n1152_k4304(std::int32_t tokens);
 
+// Qwen3.5-9B (hidden_size 4096).
+[[nodiscard]] Q5Launch select_q5_n1024_k4096(std::int32_t tokens);
+[[nodiscard]] Q5Launch select_q5_n4096_k4096(std::int32_t tokens);
+[[nodiscard]] Q5Launch select_q5_n5120_k4096(std::int32_t tokens);
+[[nodiscard]] Q5Launch select_q5_n8192_k4096(std::int32_t tokens);
+[[nodiscard]] Q5Launch select_q5_n4096_k12288(std::int32_t tokens);
+
 } // namespace ninfer::ops::detail

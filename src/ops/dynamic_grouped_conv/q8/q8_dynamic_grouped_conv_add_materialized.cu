@@ -12,6 +12,8 @@
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
+
+#if NINFER_ENABLE_LARGE_STATIC_SMEM
 namespace {
 constexpr int kRows = 5120, kGroups = 320;
 
@@ -113,4 +115,15 @@ void q8_dynamic_grouped_conv_add_materialized_launch(Q8DynamicConvAddSchedule sc
                                                      cudaStream_t stream) {
     materialized(schedule, x, weight, base, delta, residual, projected, stream);
 }
+#else
+// The tiled projection stages more than the 48 KiB of static __shared__ this target allows, so
+// the entry point stays callable but reports the limitation instead of launching.
+void q8_dynamic_grouped_conv_add_materialized_launch(Q8DynamicConvAddSchedule, const Tensor&,
+                                                     const Weight&, const Tensor&, const Tensor&,
+                                                     Tensor&, Tensor&, cudaStream_t) {
+    throw std::invalid_argument(
+        "q8 dynamic grouped conv add: unavailable on this architecture "
+        "(static shared memory limit)");
+}
+#endif
 } // namespace ninfer::ops::detail

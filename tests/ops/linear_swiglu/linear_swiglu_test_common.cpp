@@ -31,10 +31,25 @@ namespace {
 
 // The criterion belongs to the activation-compute profile, not the weight storage format or a
 // private materialized/fused implementation.
+// The A16 relative-L2 budget is sized by the *worst* route an admitted geometry may select, not by
+// the fused ones. The folded MMA and GEMV routes keep gate and up in fp32 and land near 1.6e-3, but
+// the Materialized route stores both projections as bf16 before `silu_mul`, and that store costs an
+// extra rounding on each projection which the silu sensitivity amplifies:
+//
+//     d(out)/out = [1 + g(1 - sigmoid(g))] * d(gate)/gate + d(up)/up
+//
+// The factor |1 + g(1 - sigmoid(g))| grows without bound as g goes negative, so the resulting
+// relative-L2 is data dependent and cannot be bounded by the weight format alone. Measured with
+// NINFER_TEST_SWIGLU_MATERIALIZED_FLOOR=1 (which re-runs the fp64 oracle with gate/up rounded to
+// bf16, i.e. the output of a *perfect* Materialized implementation) the floors are 3.182e-3 for the
+// 27B profile and 3.343e-3 for the 9B sign-flipped graph case; the kernel matches those floors to
+// within 1e-7, so no implementation of this route can do better than the budget below.
+//
+// Raise this only together with a re-measurement: the diagnostic above reports every floor.
 constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute) {
     switch (activation_compute) {
     case ActivationCompute::A16:
-        return {3.3e-3, 5.0e-3, 6.3e-3};
+        return {3.7e-3, 5.0e-3, 6.3e-3};
     case ActivationCompute::A8:
         // Both independently A8-quantized projections feed the nonlinear product, so this profile
         // allows twice Linear's relative-L2 quantization allowance plus a bounded gross tail.
@@ -134,10 +149,17 @@ double silu_fp64(double value) {
     return value * exponential / (1.0 + exponential);
 }
 
+// Diagnostic: the value a *perfect* Materialized implementation would return. That route writes
+// gate and up as bf16 before `silu_mul`, so even an ideal one cannot beat bf16 rounding of the two
+// projections. Rounding them here turns "is the kernel wrong" into "is the criterion reachable".
+double round_to_bf16(double value) {
+    return static_cast<double>(test::bf16_to_f32(test::f32_to_bf16(static_cast<float>(value))));
+}
+
 std::vector<double> linear_swiglu_oracle_fp64(const Profile& profile,
                                               const quantized_weight::PackedWeight& weight,
                                               const std::vector<std::uint16_t>& activation,
-                                              std::int32_t tokens) {
+                                              std::int32_t tokens, bool materialized_model = false) {
     const auto active_by_column = index_nonzero_activations(activation, profile.input_rows, tokens);
     std::vector<double> output(checked_elements(profile.output_rows, tokens, "oracle output size"));
 
@@ -170,8 +192,14 @@ std::vector<double> linear_swiglu_oracle_fp64(const Profile& profile,
                     }
                 }
                 for (std::int32_t token = 0; token < tokens; ++token) {
-                    const double fused = silu_fp64(gate[static_cast<std::size_t>(token)]) *
-                                         up[static_cast<std::size_t>(token)];
+                    double gate_value = gate[static_cast<std::size_t>(token)];
+                    double up_value   = up[static_cast<std::size_t>(token)];
+                    if (materialized_model) {
+                        gate_value = round_to_bf16(gate_value);
+                        up_value   = round_to_bf16(up_value);
+                    }
+                    double fused = silu_fp64(gate_value) * up_value;
+                    if (materialized_model) { fused = round_to_bf16(fused); }
                     output[static_cast<std::size_t>(token) * profile.output_rows + row] = fused;
                 }
             }
@@ -221,6 +249,10 @@ int verify_unchanged(std::string_view label, const test::GuardedDeviceBuffer& de
 void validate_profile(const Profile& profile) {
     const bool q4 = profile.qtype == QType::Q4_G64_FP16 && profile.gate_up_rows == 34816 &&
                     profile.input_rows == 5120 && profile.output_rows == 17408;
+    // Qwen3.5 Small 9B: the second registered Q4 geometry, stated here so a wrong production entry
+    // cannot make this test agree with itself.
+    const bool q4_9b = profile.qtype == QType::Q4_G64_FP16 && profile.gate_up_rows == 24576 &&
+                       profile.input_rows == 4096 && profile.output_rows == 12288;
     const bool q8_companion = profile.qtype == QType::Q8_G32_FP16 &&
                               profile.gate_up_rows == 12288 && profile.input_rows == 2048 &&
                               profile.output_rows == 6144;
@@ -230,7 +262,7 @@ void validate_profile(const Profile& profile) {
                        profile.input_rows == 5120 && profile.output_rows == 17408;
     const bool fp8 = profile.qtype == QType::FP8_E4M3FN_ROW_BF16 && profile.gate_up_rows == 34816 &&
                      profile.input_rows == 5120 && profile.output_rows == 17408;
-    if ((!q4 && !q8_companion && !q8_dflash2 && !nvfp4 && !fp8) ||
+    if ((!q4 && !q4_9b && !q8_companion && !q8_dflash2 && !nvfp4 && !fp8) ||
         profile.gate_up_rows != 2 * profile.output_rows) {
         throw std::invalid_argument("linear_swiglu test: profile is not registered");
     }
@@ -277,14 +309,29 @@ int run_profile(std::string_view label, const Profile& profile,
     const std::vector<std::uint16_t> host_activation = make_activation(profile, maximum_tokens);
     const std::vector<double> reference =
         linear_swiglu_oracle_fp64(profile, host_weight, host_activation, maximum_tokens);
+    // NINFER_TEST_SWIGLU_MATERIALIZED_FLOOR=1 reports the error an ideal Materialized route would
+    // have, so a criterion failure can be attributed to the data rather than to the kernel.
+    const bool report_floor = [] {
+        const char* flag = std::getenv("NINFER_TEST_SWIGLU_MATERIALIZED_FLOOR");
+        return flag != nullptr && flag[0] == '1' && flag[1] == '\0';
+    }();
+    const std::vector<double> reference_floor =
+        report_floor ? linear_swiglu_oracle_fp64(profile, host_weight, host_activation,
+                                                 maximum_tokens, true)
+                     : std::vector<double>{};
     std::vector<std::uint16_t> negative_activation;
     std::vector<double> negative_reference;
+    std::vector<double> negative_reference_floor;
     std::optional<DeviceContext> graph_context;
     if (!graph_cases.empty()) {
         negative_activation = host_activation;
         for (auto& bits : negative_activation) bits ^= 0x8000;
         negative_reference =
             linear_swiglu_oracle_fp64(profile, host_weight, negative_activation, maximum_tokens);
+        if (report_floor) {
+            negative_reference_floor = linear_swiglu_oracle_fp64(
+                profile, host_weight, negative_activation, maximum_tokens, true);
+        }
         graph_context.emplace();
     }
 
@@ -330,6 +377,7 @@ int run_profile(std::string_view label, const Profile& profile,
             for (int phase = 0; phase < (replay ? 2 : 1); ++phase) {
                 const auto& input_bits = phase ? negative_activation : host_activation;
                 const auto& expected   = phase ? negative_reference : reference;
+                const auto& floor      = phase ? negative_reference_floor : reference_floor;
                 if (replay)
                     device_activation.copy_from_host(input_bits.data(),
                                                      input_bits.size() * sizeof(std::uint16_t));
@@ -351,6 +399,18 @@ int run_profile(std::string_view label, const Profile& profile,
                 const auto actual = read_bf16_output(output, elements);
                 failures +=
                     compare_output(label_case, actual, expected.data(), profile.activation_compute);
+                if (report_floor && !floor.empty()) {
+                    // How much error the Materialized route must have, and how far this kernel is
+                    // from that unavoidable amount.
+                    (void)verify_reduction(
+                        label_case + " [floor]",
+                        std::span<const double>(floor.data(), actual.size()),
+                        std::span<const double>(expected.data(), actual.size()),
+                        tolerance_for(profile.activation_compute));
+                    (void)verify_reduction(label_case + " [vs floor]", actual,
+                                           std::span<const double>(floor.data(), actual.size()),
+                                           ReductionCriterion{1.0e-3, 1.0e-2, 1.0e-2});
+                }
                 if (replay)
                     failures += verify_unchanged(label_case + " input", device_activation,
                                                  input_bits.data(),

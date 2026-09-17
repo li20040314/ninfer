@@ -223,8 +223,22 @@ Q8LinearAddPlan q8_linear_add_resolve_plan(const Q8LinearAddProblem& problem) {
         }
         throw std::logic_error("q8 linear_add: admitted problem has no covering route");
     };
-    if (problem.rows == 5120) { return resolve_from(kN5120Routes); }
-    return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK4096Routes);
+    // Only the two split-K routes stage more than the 48 KiB of static shared memory this
+    // architecture allows; the capacity route in kN5120Routes is a different kernel family and
+    // stays available. Reject them while the plan is still being formed.
+    const auto checked = [](Q8LinearAddPlan plan) -> Q8LinearAddPlan {
+#if !NINFER_ENABLE_LARGE_STATIC_SMEM
+        if (plan.schedule == Q8LinearAddScheduleId::SplitKMmaExactT ||
+            plan.schedule == Q8LinearAddScheduleId::MediumSplitK) {
+            throw std::invalid_argument(
+                "Q8 linear_add: split-K MMA needs more than the 48 KiB of static shared memory "
+                "this architecture allows");
+        }
+#endif
+        return plan;
+    };
+    if (problem.rows == 5120) { return checked(resolve_from(kN5120Routes)); }
+    return checked(problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK4096Routes));
 }
 
 void q8_linear_add_execute_plan(const Q8LinearAddPlan& plan, const Tensor& x, const Weight& w,

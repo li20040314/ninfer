@@ -10,11 +10,14 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <iostream>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -34,6 +37,30 @@ constexpr ReductionCriterion kAttnInputProjA8Tolerance{0.04, 1.0 / 256.0, 0.06};
 constexpr ReductionCriterion kAttnInputProjA4Tolerance{0.16, 1.0 / 256.0, 0.16};
 // Retain the original seven grid points while stabilizing the distribution-level A4 criterion.
 constexpr std::int32_t kA4SampleRows = 31;
+
+// An architecture that cannot execute a route is told so when the plan is formed: the Op rejects the
+// work instead of substituting a fallback. Requesting such a route therefore aborts the process
+// (an unhandled rejection) rather than failing a comparison, so the suites below leave the routes a
+// build cannot execute out, while still covering every route it can.
+#if NINFER_ENABLE_LARGE_STATIC_SMEM
+constexpr bool kSplitKMmaExecutable = true;
+#else
+constexpr bool kSplitKMmaExecutable = false;
+#endif
+
+// The split-K MMA route is the only Q8 attention route that stages more static shared memory than
+// some architectures allow; columns 2..splitk_last resolve to it.
+constexpr bool route_executable(std::int32_t tokens, std::int32_t splitk_last) noexcept {
+    return kSplitKMmaExecutable || tokens < 2 || tokens > splitk_last;
+}
+
+// A sweep that trips a fail-fast check is terminated by the runtime, which discards buffered stdout,
+// so an abort would otherwise leave no clue about the case that caused it. NINFER_TEST_TRACE=1
+// mirrors each case to unbuffered stderr.
+void trace_case(std::string_view label) {
+    static const bool enabled = std::getenv("NINFER_TEST_TRACE") != nullptr;
+    if (enabled) { std::cerr << label << '\n'; }
+}
 
 int verify_output(std::string_view label, const GuardedBf16Tensor& output,
                   const quantized_weight::PackedWeight& weight, std::int32_t weight_row_offset,
@@ -63,29 +90,58 @@ WeightView rows(const WeightParent& parent, std::uint64_t begin, std::uint64_t c
     return {{count, k}, {{&parent, begin * k, (begin + count) * k}}};
 }
 
+// Logical fused-projection geometry under test. The numbers are stated independently of the
+// production geometry table so that a wrong production entry cannot make this test agree with
+// itself.
+struct ProjectionGeometry {
+    std::int32_t hidden;
+    std::int32_t query_rows;
+    std::int32_t kv_rows;
+
+    constexpr std::int32_t folded_rows() const noexcept { return query_rows + kv_rows; }
+    constexpr std::int32_t folded_gate_offset() const noexcept { return query_rows + kv_rows; }
+    constexpr std::int32_t folded_value_offset() const noexcept {
+        return 2 * query_rows + kv_rows;
+    }
+    constexpr std::int32_t folded_total_rows() const noexcept {
+        return 2 * (query_rows + kv_rows);
+    }
+};
+
+// Qwen3.6/3.8 27B, the tuned target.
+constexpr ProjectionGeometry kProjection27B{5120, 6144, 1024};
+// Qwen3.5 Small 9B, the Ada profile.
+constexpr ProjectionGeometry kProjection9B{4096, 4096, 1024};
+
 int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* gate_value,
-                               int tokens, ops::LinearPolicy policy, bool replay = false) {
-    constexpr int hidden = 5120, qrows = 6144, kvrows = 1024;
+                               int tokens, ops::LinearPolicy policy, bool replay = false,
+                               ProjectionGeometry geometry = kProjection27B) {
     const bool dual      = gate_value != nullptr;
-    auto activation      = make_bf16_activation(hidden, tokens, 101U + tokens);
+    auto activation      = make_bf16_activation(geometry.hidden, tokens, 101U + tokens);
     auto activation_bits = bf16_bits(activation);
     DeviceBuffer input   = to_device(activation_bits);
-    GuardedBf16Tensor query(qrows, tokens), gate(qrows, tokens), key(kvrows, tokens),
-        value(kvrows, tokens);
-    Tensor x(input.p, DType::BF16, {hidden, tokens}), q = query.tensor(), g = gate.tensor(),
-                                                      k = key.tensor(), v = value.tensor();
+    GuardedBf16Tensor query(geometry.query_rows, tokens), gate(geometry.query_rows, tokens),
+        key(geometry.kv_rows, tokens), value(geometry.kv_rows, tokens);
+    Tensor x(input.p, DType::BF16, {geometry.hidden, tokens}), q = query.tensor(),
+           g = gate.tensor(), k = key.tensor(), v = value.tensor();
     const auto capacity =
         dual ? 0
-             : ops::attn_input_proj_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16, 14336,
-                                                             hidden, policy, tokens, tokens);
+             : ops::attn_input_proj_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16,
+                                                             geometry.folded_total_rows(),
+                                                             geometry.hidden, policy, tokens,
+                                                             tokens);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
     DeviceArena workspace(DeviceSpan{scratch.data(), std::max<std::size_t>(capacity, 1)});
     DeviceContext device;
-    const auto first    = physical_parent(parent.view());
-    const auto second   = gate_value ? physical_parent(gate_value->view()) : first;
-    const auto q_weight = rows(first, 0, qrows), k_weight = rows(first, qrows, kvrows);
-    const auto g_weight = rows(dual ? second : first, dual ? 0 : 7168, qrows);
-    const auto v_weight = rows(dual ? second : first, dual ? 6144 : 13312, kvrows);
+    const auto first  = physical_parent(parent.view());
+    const auto second = gate_value ? physical_parent(gate_value->view()) : first;
+    const auto q_weight = rows(first, 0, geometry.query_rows),
+               k_weight = rows(first, geometry.query_rows, geometry.kv_rows);
+    const auto g_weight = rows(dual ? second : first,
+                               dual ? 0 : geometry.folded_gate_offset(), geometry.query_rows);
+    const auto v_weight = rows(dual ? second : first,
+                               dual ? geometry.query_rows : geometry.folded_value_offset(),
+                               geometry.kv_rows);
     const auto prepared = ops::prepare_attn_input_proj_weights(
         {q_weight, policy}, {k_weight, policy}, {g_weight, policy}, {v_weight, policy});
     const auto launch = [&] {
@@ -130,16 +186,19 @@ int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* g
         const std::string suffix = std::string(dual ? " Q4/Q5" : " FP8") +
                                    (a8 ? " allow-a8" : " a16") + " T=" + std::to_string(tokens) +
                                    " phase=" + std::to_string(phase);
-        failures += verify_output("attn q" + suffix, query, parent.host, 0, qrows, activation,
-                                  hidden, tokens, criterion, sample_count);
-        failures += verify_output("attn k" + suffix, key, parent.host, qrows, kvrows, activation,
-                                  hidden, tokens, criterion, sample_count);
-        failures += verify_output("attn gate" + suffix, gate, dual ? gate_value->host : parent.host,
-                                  dual ? 0 : 7168, qrows, activation, hidden, tokens, criterion,
+        failures += verify_output("attn q" + suffix, query, parent.host, 0, geometry.query_rows,
+                                  activation, geometry.hidden, tokens, criterion, sample_count);
+        failures += verify_output("attn k" + suffix, key, parent.host, geometry.query_rows,
+                                  geometry.kv_rows, activation, geometry.hidden, tokens, criterion,
                                   sample_count);
+        failures += verify_output("attn gate" + suffix, gate, dual ? gate_value->host : parent.host,
+                                  dual ? 0 : geometry.folded_gate_offset(), geometry.query_rows,
+                                  activation, geometry.hidden, tokens, criterion, sample_count);
         failures += verify_output("attn value" + suffix, value,
-                                  dual ? gate_value->host : parent.host, dual ? 6144 : 13312,
-                                  kvrows, activation, hidden, tokens, criterion, sample_count);
+                                  dual ? gate_value->host : parent.host,
+                                  dual ? geometry.query_rows : geometry.folded_value_offset(),
+                                  geometry.kv_rows, activation, geometry.hidden, tokens, criterion,
+                                  sample_count);
         failures += verify_preserved("attn input" + suffix, input, activation_bits);
         failures += scratch.verify_guards(suffix);
         if (workspace.used() != 0 || workspace.peak_used() > capacity) {
@@ -152,24 +211,43 @@ int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* g
     return failures;
 }
 
-int run_q4_q5() {
-    constexpr std::int32_t kHidden = 5120;
-    constexpr std::int32_t kParent = 7168;
-    DevicePackedWeight query_key(
-        quantized_weight::make_patterned_weight(QType::Q4_G64_FP16, kParent, kHidden, 103U));
-    DevicePackedWeight gate_value(
-        quantized_weight::make_patterned_weight(QType::Q5_G64_FP16, kParent, kHidden, 107U));
+int run_q4_q5_case(std::string_view profile, const ProjectionGeometry& geometry, bool full_sweep,
+                   bool replay) {
+    DevicePackedWeight query_key(quantized_weight::make_patterned_weight(
+        QType::Q4_G64_FP16, geometry.folded_rows(), geometry.hidden, 103U));
+    DevicePackedWeight gate_value(quantized_weight::make_patterned_weight(
+        QType::Q5_G64_FP16, geometry.folded_rows(), geometry.hidden, 107U));
+    const auto run = [&](int tokens, bool use_replay) {
+        trace_case("attn q4/q5 " + std::string(profile) + " T=" + std::to_string(tokens) +
+                   (use_replay ? " replay" : ""));
+        return run_target_projection_case(query_key, &gate_value, tokens,
+                                          ops::LinearPolicy::A16Only, use_replay, geometry);
+    };
 
+    // The exact problem routes on tokens: parent-split up to 12, then three MMA regions with seams
+    // at 64/104/128 and 192.
     int failures = 0;
-    for (int t = 1; t <= 128; ++t)
-        failures +=
-            run_target_projection_case(query_key, &gate_value, t, ops::LinearPolicy::A16Only);
-    for (int t : {129, 144, 145, 160, 161, 192, 193, 256, 257, 1024})
-        failures +=
-            run_target_projection_case(query_key, &gate_value, t, ops::LinearPolicy::A16Only);
-    for (int t : {1, 8, 12, 13, 16, 32, 63, 64, 65, 96, 104, 105, 127, 128, 129, 192, 193})
-        failures +=
-            run_target_projection_case(query_key, &gate_value, t, ops::LinearPolicy::A16Only, true);
+    if (full_sweep) {
+        for (int t = 1; t <= 128; ++t) { failures += run(t, false); }
+    } else {
+        for (int t = 1; t <= 12; ++t) { failures += run(t, false); }
+        for (int t : {13, 16, 32, 63, 64, 65, 96, 104, 105, 127, 128}) { failures += run(t, false); }
+    }
+    for (int t : {129, 144, 145, 160, 161, 192, 193, 256, 257, 1024}) { failures += run(t, false); }
+    if (replay) {
+        for (int t : {1, 8, 12, 13, 16, 32, 63, 64, 65, 96, 104, 105, 127, 128, 129, 192, 193}) {
+            failures += run(t, true);
+        }
+    }
+    return failures;
+}
+
+int run_q4_q5() {
+    int failures = 0;
+    // The 27B profile is the tuned target and keeps its full sweep. The 9B profile walks every
+    // route seam and the whole small-T range, which is where the new instantiation lives.
+    failures += run_q4_q5_case("27B", kProjection27B, true, true);
+    failures += run_q4_q5_case("9B", kProjection9B, false, true);
     return failures;
 }
 
@@ -440,6 +518,7 @@ int run_fp8_target() {
 }
 
 int run_q8_target_case(DevicePackedWeight& parent, std::int32_t tokens) {
+    trace_case("attn q8 target T=" + std::to_string(tokens));
     constexpr std::int32_t kHidden      = 2048;
     constexpr std::int32_t kQRows       = 4096;
     constexpr std::int32_t kKvRows      = 512;
@@ -480,6 +559,7 @@ int run_q8_target() {
         quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, 9216, kHidden, 211U));
     int failures = 0;
     for (const std::int32_t tokens : {1, 2, 17, 48, 64, 65, 129}) {
+        if (!route_executable(tokens, 64)) { continue; }
         failures += run_q8_target_case(parent, tokens);
     }
     return failures;
@@ -487,6 +567,8 @@ int run_q8_target() {
 
 int run_q8_qkv_case(DevicePackedWeight& parent, std::int32_t hidden, const char* profile,
                     std::int32_t tokens, bool graph_replay = false, int sample_rows = 7) {
+    trace_case("attn q8 " + std::string(profile) + " T=" + std::to_string(tokens) +
+               (graph_replay ? " replay" : ""));
     constexpr int kQRows = 4096, kKvRows = 1024;
     std::vector<float> activation  = make_bf16_activation(hidden, tokens, 301U + tokens);
     auto activation_bits           = bf16_bits(activation);
@@ -553,6 +635,7 @@ int run_q8_companion() {
     int failures = 0;
     // One public numerical case from every registered companion A16 T region.
     for (const std::int32_t tokens : {1, 2, 97, 193, 289, 321, 385, 449}) {
+        if (!route_executable(tokens, 96)) { continue; }
         failures += run_q8_qkv_case(parent, kHidden, "companion", tokens);
     }
     return failures;
@@ -614,13 +697,27 @@ int main(int argc, char** argv) {
     int failures = 0;
     if (inputs_only) { return run_weight_inputs() == 0 ? 0 : 1; }
     if (!dflash2_only) {
+        trace_case("suite q4/q5");
         failures += run_q4_q5();
+        trace_case("suite bf16");
         failures += run_bf16_target();
+#if NINFER_ENABLE_NVFP4
+        trace_case("suite nvfp4");
         failures += run_nvfp4_target();
+#else
+        // NVFP4 is a Blackwell weight format. A build without the kernels rejects an NVFP4 weight
+        // while it is validated instead of computing with some other format, so there is no target
+        // to compare here.
+        std::cout << "SKIP: nvfp4 attention-input targets need an NVFP4 build\n";
+#endif
+        trace_case("suite fp8");
         failures += run_fp8_target();
+        trace_case("suite q8 target");
         failures += run_q8_target();
+        trace_case("suite q8 companion");
         failures += run_q8_companion();
     }
+    trace_case("suite q8 dflash2");
     failures += run_q8_dflash2();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " attn_input_proj\n";
     return failures == 0 ? 0 : 1;

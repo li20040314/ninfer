@@ -1013,6 +1013,9 @@ int main() {
         std::cerr << "Q8 snapshot interval did not preserve its zero/nonzero route boundary\n";
         ++failures;
     }
+    // The NVFP4 capacity profile is only registered by a build that carries the kernels; without
+    // them the query rejects the profile rather than answering for some other format.
+#if NINFER_ENABLE_NVFP4
     const std::size_t nvfp4_a4_4 = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 4, 4);
     if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
@@ -1025,6 +1028,7 @@ int main() {
         std::cerr << "NVFP4 snapshot interval did not preserve its A16/A4 route boundary\n";
         ++failures;
     }
+#endif
     const auto fp8_snapshot_capacity = [](ops::LinearPolicy policy, std::int32_t batch,
                                           std::int32_t min_width, std::int32_t max_width) {
         return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
@@ -1047,7 +1051,13 @@ int main() {
     }
     failures += run_q4_q5();
     failures += run_q8();
+    // NVFP4 is a Blackwell weight format. A build without the kernels rejects an NVFP4 weight while
+    // it is validated instead of computing with some other format, so there is no target to compare.
+#if NINFER_ENABLE_NVFP4
     failures += run_nvfp4();
+#else
+    std::cout << "SKIP: nvfp4 gdn_input_proj_conv_snapshot targets need an NVFP4 build\n";
+#endif
     failures += run_fp8();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_snapshot\n";
     return failures == 0 ? 0 : 1;

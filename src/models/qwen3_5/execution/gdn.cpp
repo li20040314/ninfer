@@ -21,6 +21,17 @@ std::size_t gdn_projection_workspace_bytes(const GdnParameters& parameters, std:
     return 0;
 }
 
+// The activation width the projection reads. The Q8 profile and the paired Q4/Q5 profiles project
+// the same widths, so a capacity query over them needs this to name the profile: the 9B Q4/Q5 pair
+// and the 35B-A3B Q8 parent are both (2048, 2048, 4096).
+std::int32_t gdn_projection_input_rows(const GdnParameters& parameters) {
+    if (const auto* single = std::get_if<LinearParameters>(&parameters.projection)) {
+        return static_cast<std::int32_t>(single->weight.k);
+    }
+    const auto& pair = std::get<ops::PairedProjectionWeights>(parameters.projection);
+    return static_cast<std::int32_t>(pair.first.k);
+}
+
 std::size_t gdn_snapshot_workspace_bytes(const GdnParameters& parameters, const GdnConfig& config,
                                          std::int32_t batch, std::int32_t first_width,
                                          std::int32_t last_width) {
@@ -32,7 +43,7 @@ std::size_t gdn_snapshot_workspace_bytes(const GdnParameters& parameters, const 
             w.qtype, w.n, w.k, single->policy, batch, first_width, last_width);
     } else {
         bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            static_cast<std::int32_t>(config.key_width()),
+            gdn_projection_input_rows(parameters), static_cast<std::int32_t>(config.key_width()),
             static_cast<std::int32_t>(config.key_width()),
             static_cast<std::int32_t>(config.value_width()), batch, first_width, last_width);
     }
@@ -51,7 +62,7 @@ std::size_t gdn_record_workspace_bytes(const GdnParameters& parameters, const Gd
             w.qtype, w.n, w.k, single->policy, batch, first_width, last_width);
     } else {
         bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-            static_cast<std::int32_t>(config.key_width()),
+            gdn_projection_input_rows(parameters), static_cast<std::int32_t>(config.key_width()),
             static_cast<std::int32_t>(config.key_width()),
             static_cast<std::int32_t>(config.value_width()), batch, first_width, last_width);
     }

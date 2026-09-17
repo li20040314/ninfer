@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NInfer 本地对话 · Qwen3.8-27B</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1e222b;
+    --line: #2a2f3a;
+    --text: #e6e9ef;
+    --muted: #8b93a5;
+    --accent: #4f8cff;
+    --accent-dim: #2b4a80;
+    --user: #223049;
+    --think: #6f7688;
+    --ok: #3fb950;
+    --bad: #f85149;
+    --warn: #d29922;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --panel-2: #f0f2f5;
+      --line: #d9dde4;
+      --text: #1b1f27;
+      --muted: #667085;
+      --accent: #2563eb;
+      --accent-dim: #c7dbff;
+      --user: #e4edff;
+      --think: #7a8296;
+      --ok: #1a7f37;
+      --bad: #cf222e;
+      --warn: #9a6700;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.6 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+    padding: 12px 18px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+  .brand { font-weight: 600; letter-spacing: .3px; }
+  .brand small { color: var(--muted); font-weight: 400; margin-left: 8px; }
+  .spacer { flex: 1; }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    padding: 3px 9px;
+    border-radius: 20px;
+    border: 1px solid var(--line);
+    background: var(--panel-2);
+    color: var(--muted);
+  }
+  .badge::before {
+    content: "";
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--warn);
+  }
+  .badge.ok::before { background: var(--ok); }
+  .badge.bad::before { background: var(--bad); }
+  .mono { font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; color: var(--muted); }
+  .controls { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); }
+  .controls label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; user-select: none; }
+  select, button, textarea {
+    font: inherit;
+    color: var(--text);
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    outline: none;
+  }
+  select { padding: 4px 6px; font-size: 13px; }
+  button { padding: 5px 12px; cursor: pointer; font-size: 13px; }
+  button:hover { border-color: var(--accent-dim); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:disabled { opacity: .5; cursor: default; }
+  main {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px 18px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    max-width: 980px;
+    width: 100%;
+    margin: 0 auto;
+  }
+  .empty { margin: auto; text-align: center; color: var(--muted); font-size: 14px; line-height: 2; }
+  .empty code {
+    background: var(--panel-2); border: 1px solid var(--line);
+    padding: 2px 6px; border-radius: 5px; font-family: Consolas, monospace;
+  }
+  .row { display: flex; flex-direction: column; gap: 6px; }
+  .row .who { font-size: 12px; color: var(--muted); }
+  .bubble {
+    padding: 11px 14px;
+    border-radius: 12px;
+    border: 1px solid var(--line);
+    background: var(--panel);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .row.user { align-items: flex-end; }
+  .row.user .bubble { background: var(--user); border-color: var(--accent-dim); max-width: 82%; }
+  .row.assistant .bubble { max-width: 92%; }
+  .think {
+    white-space: pre-wrap;
+    color: var(--think);
+    font-size: 13px;
+    border-left: 2px solid var(--line);
+    padding: 2px 0 2px 10px;
+    margin-bottom: 8px;
+  }
+  .bubble pre {
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 10px 12px;
+    overflow-x: auto;
+    margin: 8px 0;
+    font-family: Consolas, "Cascadia Mono", monospace;
+    font-size: 13px;
+    white-space: pre;
+  }
+  .bubble code {
+    font-family: Consolas, "Cascadia Mono", monospace;
+    font-size: 13px;
+    background: var(--panel-2);
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+  .bubble pre code { background: none; padding: 0; }
+  .stats { font-size: 12px; color: var(--muted); }
+  .error {
+    border-color: var(--bad);
+    color: var(--bad);
+    font-size: 13px;
+  }
+  footer {
+    display: flex;
+    gap: 10px;
+    align-items: flex-end;
+    padding: 12px 18px 18px;
+    background: var(--panel);
+    border-top: 1px solid var(--line);
+    max-width: 980px;
+    width: 100%;
+    margin: 0 auto;
+    position: sticky;
+    bottom: 0;
+  }
+  textarea {
+    flex: 1;
+    resize: none;
+    padding: 10px 12px;
+    max-height: 180px;
+    line-height: 1.5;
+  }
+  textarea:focus, select:focus { border-color: var(--accent-dim); }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">NInfer 本地对话<small>Qwen3.8-27B · 权重流送 + MTP 投机解码</small></div>
+  <div class="spacer"></div>
+  <span id="status" class="badge">连接中…</span>
+  <span id="model" class="mono"></span>
+  <div class="controls">
+    <label><input type="checkbox" id="thinking"> 思考</label>
+    <label>长度
+      <select id="maxTokens">
+        <option>256</option>
+        <option>512</option>
+        <option selected>1024</option>
+        <option>2048</option>
+        <option>4096</option>
+      </select>
+    </label>
+    <button id="reset">清空</button>
+  </div>
+</header>
+
+<main id="chat">
+  <div class="empty" id="empty">
+    模型已就绪，直接提问即可。<br>
+    <span class="mono">Enter 发送 · Shift+Enter 换行 · 首字前需要等一次权重流送（约 1~3 秒）</span>
+  </div>
+</main>
+
+<footer>
+  <textarea id="input" rows="1" placeholder="输入问题，Enter 发送，Shift+Enter 换行"></textarea>
+  <button id="send" class="primary">发送</button>
+</footer>
+
+<script>
+(function () {
+  'use strict';
+
+  var params    = new URLSearchParams(location.search);
+  var port      = params.get('port') || '8080';
+  var host      = params.get('host') || '127.0.0.1';
+  var apiKey    = params.get('key') || '';
+  var baseUrl   = 'http://' + host + ':' + port;
+
+  var chatEl    = document.getElementById('chat');
+  var emptyEl   = document.getElementById('empty');
+  var inputEl   = document.getElementById('input');
+  var sendEl    = document.getElementById('send');
+  var statusEl  = document.getElementById('status');
+  var modelEl   = document.getElementById('model');
+  var resetEl   = document.getElementById('reset');
+  var thinkEl   = document.getElementById('thinking');
+  var tokensEl  = document.getElementById('maxTokens');
+
+  var history   = [];
+  var modelId   = 'local';
+  var running   = false;
+  var controller = null;
+
+  function setStatus(kind, text) {
+    statusEl.className = 'badge ' + kind;
+    statusEl.textContent = text;
+  }
+
+  function headers() {
+    var h = { 'Content-Type': 'application/json' };
+    if (apiKey) { h['Authorization'] = 'Bearer ' + apiKey; }
+    return h;
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  // Minimal markdown: escape first, then only fenced code, inline code and bold.
+  function render(text) {
+    var out = escapeHtml(text);
+    var blocks = [];
+    out = out.replace(/```[^\n]*\n([\s\S]*?)```/g, function (_, code) {
+      blocks.push(code.replace(/\n$/, ''));
+      return '\u0000' + (blocks.length - 1) + '\u0000';
+    });
+    out = out.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+    out = out.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+    return out.replace(/\u0000(\d+)\u0000/g, function (_, i) {
+      return '<pre><code>' + blocks[Number(i)] + '</code></pre>';
+    });
+  }
+
+  function addRow(role) {
+    if (emptyEl && emptyEl.parentNode) { emptyEl.remove(); }
+    var row = document.createElement('div');
+    row.className = 'row ' + role;
+    var who = document.createElement('div');
+    who.className = 'who';
+    who.textContent = role === 'user' ? '你' : '模型';
+    var bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    var stats = document.createElement('div');
+    stats.className = 'stats';
+    row.appendChild(who);
+    row.appendChild(bubble);
+    row.appendChild(stats);
+    chatEl.appendChild(row);
+    return { row: row, bubble: bubble, stats: stats };
+  }
+
+  function scrollDown() { chatEl.scrollTop = chatEl.scrollHeight; }
+
+  function refreshModels() {
+    return fetch(baseUrl + '/v1/models', { headers: headers() })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        var list = data && data.data ? data.data : [];
+        if (list.length && list[0].id) { modelId = list[0].id; }
+        modelEl.textContent = modelId;
+        setStatus('ok', '已连接');
+        return true;
+      })
+      .catch(function () {
+        setStatus('bad', '未连接');
+        modelEl.textContent = baseUrl;
+        return false;
+      });
+  }
+
+  function autoGrow() {
+    inputEl.style.height = 'auto';
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 180) + 'px';
+  }
+
+  function stop() {
+    if (controller) { controller.abort(); }
+  }
+
+  function send() {
+    if (running) { stop(); return; }
+    var text = inputEl.value.trim();
+    if (!text) { return; }
+
+    var user = addRow('user');
+    user.bubble.textContent = text;
+    history.push({ role: 'user', content: text });
+
+    inputEl.value = '';
+    autoGrow();
+    scrollDown();
+
+    var reply = addRow('assistant');
+    var thinkBox = null;
+    var answer = '';
+    var thinking = '';
+    var started = Date.now();
+
+    running = true;
+    sendEl.textContent = '停止';
+    controller = new AbortController();
+
+    var body = {
+      model: modelId,
+      messages: history.slice(),
+      stream: true,
+      max_tokens: Number(tokensEl.value),
+      enable_thinking: thinkEl.checked
+    };
+
+    var tokens = 0;
+    var ticker = setInterval(function () {
+      var s = (Date.now() - started) / 1000;
+      reply.stats.textContent = '已生成 ' + tokens + ' 字 · ' + s.toFixed(1) + ' s · '
+        + (s > 0 ? (tokens / s).toFixed(1) : '0.0') + ' 字/秒';
+      scrollDown();
+    }, 250);
+
+    function finish(note) {
+      clearInterval(ticker);
+      running = false;
+      sendEl.textContent = '发送';
+      controller = null;
+      var s = (Date.now() - started) / 1000;
+      reply.stats.textContent = (note ? note + ' · ' : '')
+        + '共 ' + tokens + ' 字 · ' + s.toFixed(1) + ' s · '
+        + (s > 0 ? (tokens / s).toFixed(1) : '0.0') + ' 字/秒';
+      scrollDown();
+    }
+
+    fetch(baseUrl + '/v1/chat/completions', {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify(body),
+      signal: controller.signal
+    }).then(function (resp) {
+      if (!resp.ok) {
+        return resp.text().then(function (t) { throw new Error('HTTP ' + resp.status + ' ' + t); });
+      }
+      var reader = resp.body.getReader();
+      var decoder = new TextDecoder('utf-8');
+      var buffer = '';
+
+      function pump() {
+        return reader.read().then(function (chunk) {
+          if (chunk.done) {
+            finish('');
+            history.push({ role: 'assistant', content: answer });
+            return;
+          }
+          buffer += decoder.decode(chunk.value, { stream: true });
+          var lines = buffer.split('\n');
+          buffer = lines.pop();
+          for (var i = 0; i < lines.length; i++) {
+            var line = lines[i].trim();
+            if (line.indexOf('data:') !== 0) { continue; }
+            var payload = line.slice(5).trim();
+            if (payload === '[DONE]') { continue; }
+            var evt;
+            try { evt = JSON.parse(payload); } catch (e) { continue; }
+            var choice = evt.choices && evt.choices[0];
+            if (!choice) { continue; }
+            var delta = choice.delta || {};
+            if (delta.reasoning_content) {
+              thinking += delta.reasoning_content;
+              if (!thinkBox) {
+                thinkBox = document.createElement('div');
+                thinkBox.className = 'think';
+                reply.bubble.appendChild(thinkBox);
+              }
+              thinkBox.textContent = thinking;
+            }
+            if (delta.content) {
+              answer += delta.content;
+              tokens += delta.content.length;
+              reply.bubble.innerHTML = (thinkBox ? thinkBox.outerHTML : '') + render(answer);
+            }
+          }
+          scrollDown();
+          return pump();
+        });
+      }
+      return pump();
+    }).catch(function (err) {
+      if (err && err.name === 'AbortError') {
+        finish('已停止');
+        if (answer) { history.push({ role: 'assistant', content: answer }); }
+        return;
+      }
+      finish('');
+      var box = document.createElement('div');
+      box.className = 'bubble error';
+      box.textContent = '请求失败：' + (err && err.message ? err.message : String(err));
+      reply.row.appendChild(box);
+      history.pop();
+    });
+  }
+
+  sendEl.addEventListener('click', send);
+  inputEl.addEventListener('input', autoGrow);
+  inputEl.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+  resetEl.addEventListener('click', function () {
+    history = [];
+    chatEl.innerHTML = '';
+    var e2 = document.createElement('div');
+    e2.className = 'empty';
+    e2.id = 'empty';
+    e2.innerHTML = '上下文已清空，可以开始新的对话。';
+    chatEl.appendChild(e2);
+    emptyEl = e2;
+    inputEl.focus();
+  });
+
+  autoGrow();
+  refreshModels();
+  setInterval(function () { if (!running) { refreshModels(); } }, 15000);
+  inputEl.focus();
+})();
+</script>
+</body>
+</html>

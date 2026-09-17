@@ -50,8 +50,15 @@ KvCacheStorage parse_kv_dtype(const char* text) {
     if (value == "bf16") { return KvCacheStorage::BFloat16; }
     if (value == "int8") { return KvCacheStorage::Int8Group64; }
     if (value == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
-    if (value == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
-    if (value == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
+    if (value == "nvfp4" || value == "k8v4") {
+#if defined(NINFER_ENABLE_NVFP4) && NINFER_ENABLE_NVFP4
+        return value == "nvfp4" ? KvCacheStorage::Nvfp4Group16
+                                : KvCacheStorage::Fp8KeyNvfp4Value;
+#else
+        throw std::invalid_argument("--kv-dtype " + value +
+                                    " requires a Blackwell (sm_100+/sm_120+) build");
+#endif
+    }
     throw std::invalid_argument("invalid kv-dtype: " + value);
 }
 
@@ -103,6 +110,12 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
+           "       --offload-ratio streams the given fraction of text-layer weight bytes from "
+           "host memory each token (0 disables; forces --no-cuda-graph)\n"
+           "       --host-embedding keeps the embedding table in page-locked host memory, where "
+           "the row gather reads it directly; the freed device memory goes to resident layers\n"
+           "       --host-output-head contracts the output head on the CPU from host memory "
+           "instead of holding it resident; the freed device memory goes to resident layers\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=max(max-concurrency,4), anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
            "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
@@ -282,6 +295,18 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--offload-ratio") {
+            options.weight_offload_ratio =
+                parse_float_in(require_value("--offload-ratio"), "offload-ratio", 0.0f, 1.0f);
+            if (options.weight_offload_ratio >= 1.0f) {
+                throw std::invalid_argument("--offload-ratio must be below 1.0");
+            }
+        } else if (arg == "--host-embedding") {
+            options.host_embedding = true;
+        } else if (arg == "--host-output-head") {
+            options.host_output_head = true;
+        } else if (arg == "--host-linear") {
+            options.host_linear = true;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
         } else if (arg == "--lm-head-draft") {

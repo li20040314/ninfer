@@ -91,6 +91,17 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
 
 /**
+ * The authoritative form of the query above. The projected widths alone cannot name the profile:
+ * the 9B Q4/Q5 geometry and the 35B-A3B Q8 geometry both project (2048, 2048, 4096), and only the
+ * activation width separates them. Callers that can name `input_rows` must use this overload; the
+ * width-only form keeps its historical Q8 reading of the shared tuple.
+ */
+[[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+    std::int32_t input_rows, std::int32_t query_rows, std::int32_t key_rows,
+    std::int32_t value_rows, std::int32_t batch_size, std::int32_t min_width,
+    std::int32_t max_width);
+
+/**
  * Returns the transient capacity for a registered [16384,5120] NVFP4 or row-scaled FP8 snapshot
  * profile. `batch_size` is exact and the query covers every W in the inclusive width interval.
  * B=1 preserves the format-specific fused/materialized resolver; B=2..8 covers its aggregate
@@ -181,6 +192,16 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
 [[nodiscard]] std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
+
+/**
+ * The authoritative form of the query above, discriminated by the activation width. See the
+ * snapshot counterpart: the shared (2048, 2048, 4096) tuple makes the width-only form ambiguous
+ * between the 9B Q4/Q5 geometry and the 35B-A3B Q8 geometry.
+ */
+[[nodiscard]] std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
+    std::int32_t input_rows, std::int32_t query_rows, std::int32_t key_rows,
+    std::int32_t value_rows, std::int32_t batch_size, std::int32_t min_width,
+    std::int32_t max_width);
 
 /**
  * Returns the transient capacity for a registered [16384,5120] NVFP4 or row-scaled FP8

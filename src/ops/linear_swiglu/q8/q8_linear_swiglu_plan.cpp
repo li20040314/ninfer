@@ -142,8 +142,19 @@ Q8LinearSwiGluPlan q8_linear_swiglu_resolve_plan(const Q8LinearSwiGluProblem& pr
         }
         throw std::logic_error("Q8 LinearSwiGLU: admitted problem has no route");
     };
-    if (is_dflash2_shape(problem)) { return resolve_from(kDFlash2Routes); }
-    return resolve_from(kCompanionRoutes);
+    const Q8LinearSwiGluPlan plan =
+        is_dflash2_shape(problem) ? resolve_from(kDFlash2Routes) : resolve_from(kCompanionRoutes);
+#if !NINFER_ENABLE_LARGE_STATIC_SMEM
+    // Only this schedule stages more than the 48 KiB of static shared memory this architecture
+    // allows; every other schedule in both catalogs stays available. Reject it while the plan is
+    // still being formed.
+    if (plan.schedule == Q8LinearSwiGluScheduleId::DFlash2MmaR64C96K128) {
+        throw std::invalid_argument(
+            "Q8 LinearSwiGLU: the dflash2 r64_c96_k128 schedule needs more than the 48 KiB of "
+            "static shared memory this architecture allows");
+    }
+#endif
+    return plan;
 }
 
 void q8_linear_swiglu_execute_plan(const Q8LinearSwiGluPlan& plan, const Tensor& x, const Weight& w,

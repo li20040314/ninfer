@@ -244,6 +244,10 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.kv_cache                 = options_.kv_cache;
     engine_options.enable_vision            = options_.enable_vision;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
+    engine_options.weight_offload_ratio     = options_.weight_offload_ratio;
+    engine_options.host_embedding           = options_.host_embedding;
+    engine_options.host_output_head         = options_.host_output_head;
+    engine_options.host_linear              = options_.host_linear;
     engine_options.speculative              = options_.speculative;
     engine_options.context_cache            = options_.context_cache;
     engine_options.context_cost.preset_path = options_.context_cost_presets;

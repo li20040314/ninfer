@@ -62,3 +62,8 @@ profiles/
 
 # Claude Code personal/local settings (may contain API tokens)
 .claude/settings.local.json
+
+# Local project data & personal artifacts (do not publish)
+.workbuddy/
+out.cubin
+persist_proj.txt

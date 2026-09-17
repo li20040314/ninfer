@@ -1,12 +1,10 @@
 #include "product/logging/startup_log.h"
 
+#include "core/platform.h"
 #include "product/logging/logging.h"
 #include "product/logging/pretty_format.h"
 
 #include <spdlog/logger.h>
-
-#include <sys/ioctl.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -75,11 +73,7 @@ PhasePresentation phase_presentation(StartupPhase phase) noexcept {
             false};
 }
 
-std::size_t terminal_columns() noexcept {
-    winsize size{};
-    if (::ioctl(STDERR_FILENO, TIOCGWINSZ, &size) == 0 && size.ws_col != 0) { return size.ws_col; }
-    return 120;
-}
+std::size_t terminal_columns() noexcept { return platform::standard_error_columns(120); }
 
 std::string progress_bar(double ratio, std::size_t width) {
     const std::size_t completed = static_cast<std::size_t>(ratio * static_cast<double>(width));
